@@ -148,23 +148,16 @@ app_license = "mit"
 # Scheduled Tasks
 # ---------------
 
-# scheduler_events = {
-# 	"all": [
-# 		"aws_s3_storage.tasks.all"
-# 	],
-# 	"daily": [
-# 		"aws_s3_storage.tasks.daily"
-# 	],
-# 	"hourly": [
-# 		"aws_s3_storage.tasks.hourly"
-# 	],
-# 	"weekly": [
-# 		"aws_s3_storage.tasks.weekly"
-# 	],
-# 	"monthly": [
-# 		"aws_s3_storage.tasks.monthly"
-# 	],
-# }
+scheduler_events = {
+	"daily": [
+		"aws_s3_storage.aws_s3_storage.s3_utils.sync_backups_to_s3"
+	]
+}
+
+# AWS S3 Integration Hooks
+write_file = "aws_s3_storage.aws_s3_storage.s3_utils.write_file_to_s3"
+delete_file_data_content = "aws_s3_storage.aws_s3_storage.s3_utils.delete_file_from_s3"
+write_file_keys = ["file_name", "file_url", "file_size"]
 
 # Testing
 # -------
