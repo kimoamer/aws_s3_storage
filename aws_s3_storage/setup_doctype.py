@@ -32,6 +32,7 @@ def create_doctype():
                         {"fieldname": "region", "fieldtype": "Data", "label": "Region", "reqd": 1},
                         {"fieldname": "access_key_id", "fieldtype": "Data", "label": "Access Key ID", "reqd": 1},
                         {"fieldname": "secret_access_key", "fieldtype": "Password", "label": "Secret Access Key", "reqd": 1},
+                        {"fieldname": "endpoint_url", "fieldtype": "Data", "label": "Endpoint URL"},
                     ],
                     "permissions": [{"role": "System Manager", "read": 1, "write": 1, "create": 1}]
                 })

@@ -9,7 +9,8 @@
   "bucket_name",
   "region",
   "access_key_id",
-  "secret_access_key"
+  "secret_access_key",
+  "endpoint_url"
  ],
  "fields": [
   {
@@ -39,13 +40,19 @@
    "in_list_view": 1,
    "label": "Secret Access Key",
    "reqd": 1
+  },
+  {
+   "description": "Optional. Set for S3-compatible services (MinIO, DigitalOcean Spaces, Wasabi). Leave blank for AWS S3.",
+   "fieldname": "endpoint_url",
+   "fieldtype": "Data",
+   "label": "Endpoint URL"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2026-02-21 00:41:30.854012",
+ "modified": "2026-07-22 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Aws S3 Storage",
  "name": "S3 Settings",
