@@ -1,4 +1,4 @@
-# Copyright (c) 2026, Frappe and contributors
+# Copyright (c) 2026, Innomate LLC
 # For license information, please see license.txt
 
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields

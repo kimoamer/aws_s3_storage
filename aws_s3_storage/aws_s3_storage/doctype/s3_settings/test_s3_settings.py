@@ -1,4 +1,4 @@
-# Copyright (c) 2026, Frappe and Contributors
+# Copyright (c) 2026, Innomate LLC
 # See license.txt
 
 import base64
