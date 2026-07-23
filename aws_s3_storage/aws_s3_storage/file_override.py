@@ -34,6 +34,21 @@ class S3File(File):
 			if thumb_key:
 				self.s3_thumbnail_key = thumb_key
 
+	def get_full_path(self):
+		# Frappe's get_full_path() runs the "/api/method/..." URL through is_safe_path()
+		# and rejects it ("Cannot access file path") while saving the record. For an
+		# S3-backed file the URL *is* the location, so return it directly and skip the
+		# local-filesystem path handling.
+		if s3_utils._extract_key(self.file_url):
+			return self.file_url
+		return super().get_full_path()
+
+	def validate_file_on_disk(self):
+		# S3-backed files never live on the local disk.
+		if s3_utils._extract_key(self.file_url):
+			return True
+		return super().validate_file_on_disk()
+
 	def get_content(self) -> bytes:
 		if not self.get("content") and self.file_url:
 			key = s3_utils._extract_key(self.file_url)

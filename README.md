@@ -46,35 +46,42 @@ bucket name:
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "AppObjectAccess",
-      "Effect": "Allow",
-      "Action": [
-        "s3:PutObject",
-        "s3:GetObject",
-        "s3:DeleteObject"
-      ],
-      "Resource": "arn:aws:s3:::YOUR_BUCKET/*"
-    },
-    {
       "Sid": "AppBucketAccess",
       "Effect": "Allow",
       "Action": [
-        "s3:ListBucket"
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
       ],
       "Resource": "arn:aws:s3:::YOUR_BUCKET"
+    },
+    {
+      "Sid": "AppObjectAccess",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::YOUR_BUCKET/*"
     }
   ]
 }
 ```
 
+> Note the two **different** resources: bucket-level actions target the bucket ARN
+> (`arn:aws:s3:::YOUR_BUCKET`) while object actions target everything inside it
+> (`.../*`). Splitting them like this is what makes the policy work — a single
+> statement covering only `/*` causes `AccessDenied` on the bucket-level calls.
+
 Why each action is needed:
 
-| Action | Used for |
-| --- | --- |
-| `s3:PutObject` | Uploading files, thumbnails, and backups. |
-| `s3:GetObject` | Serving files (presigned GET), reading content/thumbnails server-side, and `HeadObject` for idempotent backup sync. |
-| `s3:DeleteObject` | Removing objects when a File is deleted. |
-| `s3:ListBucket` | `HeadBucket`, used by the **Test Connection** button. |
+| Action | Resource | Used for |
+| --- | --- | --- |
+| `s3:GetObject` | `/*` | Serving files (presigned GET), reading content/thumbnails server-side, and `HeadObject` for idempotent backup sync. |
+| `s3:PutObject` | `/*` | Uploading files, thumbnails, and backups. |
+| `s3:DeleteObject` | `/*` | Removing objects when a File is deleted. |
+| `s3:ListBucket` | bucket | `HeadBucket`, used by the **Test Connection** button. |
+| `s3:GetBucketLocation` | bucket | boto3 resolves the bucket's region with this call; without it some setups fail with `AccessDenied`. |
 
 #### 1.3 Create an IAM user and access keys
 
