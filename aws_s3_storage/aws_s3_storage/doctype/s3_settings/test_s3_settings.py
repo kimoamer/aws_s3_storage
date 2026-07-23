@@ -154,6 +154,24 @@ class TestS3Settings(FrappeTestCase):
 		captured[0]()  # simulate the post-commit callback firing
 		s3.delete_object.assert_called_once_with(Bucket="test-bucket", Key=key)
 
+	@patch.object(s3_utils, "get_s3_client")
+	def test_delete_falls_back_to_local_for_non_s3_files(self, mock_get_client):
+		# A legacy file stored on local disk (no S3 key) must still be cleaned up
+		# via Frappe's own on-disk deletion, not silently leaked.
+		recorded = {}
+
+		class FakeFile:
+			file_url = "/private/files/legacy.pdf"
+			thumbnail_url = None
+
+			def delete_file_from_filesystem(self, only_thumbnail=False):
+				recorded["only_thumbnail"] = only_thumbnail
+
+		s3_utils.delete_file_from_s3(FakeFile())
+
+		self.assertEqual(recorded.get("only_thumbnail"), False)
+		mock_get_client.assert_not_called()
+
 	# --- backup sync -------------------------------------------------------
 
 	@patch.object(s3_utils, "get_s3_client")

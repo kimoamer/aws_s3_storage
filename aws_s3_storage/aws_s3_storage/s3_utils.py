@@ -226,17 +226,23 @@ def delete_file_from_s3(doc, only_thumbnail=False):
 	commits. If the delete is rolled back, the callback is discarded and the files
 	are preserved — the File record and its object never drift apart.
 	"""
-	settings = frappe.get_single("S3 Settings")
-	if not settings.bucket_name:
-		return
-
 	keys = []
 	if not only_thumbnail and getattr(doc, "file_url", None):
 		keys.append(_extract_key(doc.file_url))
 	if getattr(doc, "thumbnail_url", None):
 		keys.append(_extract_key(doc.thumbnail_url))
 	keys = [k for k in keys if k]
+
 	if not keys:
+		# No S3-managed object here (e.g. a file uploaded before this app was
+		# installed, still living on local disk). Since this hook fully replaces
+		# Frappe's on-disk cleanup, fall back to it so the file is not leaked.
+		if hasattr(doc, "delete_file_from_filesystem"):
+			doc.delete_file_from_filesystem(only_thumbnail=only_thumbnail)
+		return
+
+	settings = frappe.get_single("S3 Settings")
+	if not settings.bucket_name:
 		return
 
 	bucket = settings.bucket_name
