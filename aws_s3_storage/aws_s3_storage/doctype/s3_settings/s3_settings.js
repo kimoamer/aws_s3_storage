@@ -23,7 +23,7 @@ frappe.ui.form.on("S3 Settings", {
 		frm.add_custom_button(__("Migrate Local Files"), () => {
 			frappe.confirm(
 				__(
-					"Upload files currently stored on local disk to S3 in the background? Local copies are removed only after each object is verified in S3."
+					"Upload files currently stored on local disk to S3 in the background? Local copies are removed only after each object is verified in S3. Attach fields are repointed automatically; links embedded in rich text / Print Formats are not — run audit_local_links to review those."
 				),
 				() => {
 					frappe.call({

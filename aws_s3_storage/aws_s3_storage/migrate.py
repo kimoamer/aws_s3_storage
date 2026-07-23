@@ -153,6 +153,9 @@ def migrate_file(name, delete_local=1):
 			old_thumb_url = thumb_url
 
 	doc.db_set(update, update_modified=False)
+	# The File record now points at S3, but the linked document's own Attach /
+	# Attach Image field still holds the old local URL — repoint it too.
+	_update_attached_field(doc, old_main_url, update["file_url"])
 	frappe.db.commit()
 
 	if delete_local:
@@ -174,6 +177,150 @@ def _remove_local_if_unreferenced(field, url):
 			os.remove(path)
 	except Exception as e:
 		frappe.logger().error(f"S3 migration: could not remove local file {path}: {e}")
+
+
+def _update_attached_field(doc, old_url, new_url):
+	"""Repoint the linked document's Attach / Attach Image field at the new URL.
+
+	Only touches the field when it still holds the exact old local URL, so it can
+	never clobber an unrelated value.
+	"""
+	if not (doc.attached_to_doctype and doc.attached_to_name and doc.attached_to_field):
+		return
+	try:
+		current = frappe.db.get_value(doc.attached_to_doctype, doc.attached_to_name, doc.attached_to_field)
+		if current == old_url:
+			frappe.db.set_value(
+				doc.attached_to_doctype,
+				doc.attached_to_name,
+				doc.attached_to_field,
+				new_url,
+				update_modified=False,
+			)
+	except Exception as e:
+		frappe.logger().error(
+			f"S3 migration: could not update {doc.attached_to_doctype}.{doc.attached_to_field}"
+			f" for {doc.attached_to_name}: {e}"
+		)
+
+
+# ---------------------------------------------------------------------------
+# Reclaim local space after a delete_local=0 migration
+# ---------------------------------------------------------------------------
+
+
+@frappe.whitelist()
+def start_cleanup(batch_size=200):
+	"""Enqueue deletion of local copies of already-migrated files (System Manager)."""
+	frappe.only_for("System Manager")
+	frappe.enqueue(
+		"aws_s3_storage.aws_s3_storage.migrate.cleanup_migrated_local_files",
+		queue="long",
+		timeout=0,
+		batch_size=cint(batch_size),
+	)
+	return {"ok": True}
+
+
+def cleanup_migrated_local_files(batch_size=200):
+	"""Delete on-disk copies of files that are already migrated and verified in S3.
+
+	Use this after a ``delete_local=0`` migration. It never removes a file another
+	(not-yet-migrated) File record still points at locally, and only after
+	confirming the S3 object exists.
+	"""
+	batch_size = cint(batch_size) or 200
+	removed = 0
+	last = ""
+	while True:
+		rows = frappe.get_all(
+			"File",
+			filters={"is_folder": 0, "s3_key": ["not in", ["", None]], "name": [">", last]},
+			fields=["name", "file_name", "is_private", "s3_key"],
+			order_by="name asc",
+			limit=batch_size,
+		)
+		if not rows:
+			break
+		for row in rows:
+			last = row.name
+			if _delete_migrated_local_copy(row):
+				removed += 1
+		frappe.db.commit()
+
+	frappe.logger().info(f"S3 local cleanup finished: removed {removed} file(s)")
+	return {"removed": removed}
+
+
+def _delete_migrated_local_copy(row):
+	if not row.file_name:
+		return False
+	local_url = ("/private/files/" if row.is_private else "/files/") + row.file_name
+	path = _full_path(local_url)
+	if not path or not os.path.exists(path):
+		return False
+	# A sibling still on local disk needs the file — keep it.
+	if frappe.db.exists("File", {"file_url": local_url}):
+		return False
+	# Confirm the object is really in S3 before deleting the only local copy.
+	try:
+		if not s3_utils.object_exists(row.s3_key):
+			return False
+	except Exception:
+		return False
+	try:
+		os.remove(path)
+		return True
+	except Exception as e:
+		frappe.logger().error(f"S3 cleanup: could not remove {path}: {e}")
+		return False
+
+
+# ---------------------------------------------------------------------------
+# Read-only audit of stale local links
+# ---------------------------------------------------------------------------
+
+_LINK_FIELDTYPES = ("Attach", "Attach Image", "Text Editor", "HTML Editor", "Code")
+
+
+@frappe.whitelist()
+def audit_local_links():
+	"""Report fields that still contain local ``/files/`` links (read-only).
+
+	Attach / Attach Image fields are repointed automatically during migration, but
+	links embedded in rich-text / HTML / Print Format content are **not** rewritten.
+	This lists where such links remain so they can be reviewed manually — it changes
+	nothing.
+	"""
+	frappe.only_for("System Manager")
+
+	fields = frappe.get_all(
+		"DocField",
+		filters={"fieldtype": ["in", _LINK_FIELDTYPES]},
+		fields=["parent as doctype", "fieldname", "fieldtype"],
+	)
+	fields += frappe.get_all(
+		"Custom Field",
+		filters={"fieldtype": ["in", _LINK_FIELDTYPES]},
+		fields=["dt as doctype", "fieldname", "fieldtype"],
+	)
+
+	findings = []
+	for f in fields:
+		try:
+			meta = frappe.get_meta(f.doctype)
+			if meta.issingle or getattr(meta, "is_virtual", 0):
+				continue
+			count = frappe.db.count(f.doctype, {f.fieldname: ["like", "%/files/%"]})
+			if count:
+				findings.append(
+					{"doctype": f.doctype, "fieldname": f.fieldname, "fieldtype": f.fieldtype, "rows": count}
+				)
+		except Exception:
+			continue
+
+	findings.sort(key=lambda x: x["rows"], reverse=True)
+	return findings
 
 
 def _full_path(file_url):
