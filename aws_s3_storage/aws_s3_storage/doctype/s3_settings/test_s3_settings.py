@@ -34,6 +34,27 @@ class TestS3Settings(FrappeTestCase):
 		self.assertIsNone(s3_utils._extract_key("/files/foo.png"))
 		self.assertIsNone(s3_utils._extract_key(None))
 
+	def test_build_file_url_keeps_slashes_unencoded(self):
+		url = s3_utils._build_file_url("public/uid/fb.png")
+		self.assertIn("key=public/uid/fb.png", url)
+		self.assertNotIn("%2F", url)
+
+	def test_normalize_key_strips_double_encoding(self):
+		self.assertEqual(s3_utils._normalize_key("public/uid/fb.png"), "public/uid/fb.png")
+		self.assertEqual(s3_utils._normalize_key("public%2Fuid%2Ffb.png"), "public/uid/fb.png")
+		self.assertEqual(s3_utils._normalize_key("public%252Fuid%252Ffb.png"), "public/uid/fb.png")
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_download_accepts_encoded_key(self, mock_get_client):
+		s3 = MagicMock()
+		s3.generate_presigned_url.return_value = "https://signed.example/x"
+		mock_get_client.return_value = s3
+
+		s3_utils.download_file("public%2Fuid%2Ffb.png")
+
+		_, kwargs = s3.generate_presigned_url.call_args
+		self.assertEqual(kwargs["Params"]["Key"], "public/uid/fb.png")
+
 	def test_swap_prefix(self):
 		self.assertEqual(s3_utils._swap_prefix("public/u/f.png", 1), "private/u/f.png")
 		self.assertEqual(s3_utils._swap_prefix("private/u/f.png", 0), "public/u/f.png")

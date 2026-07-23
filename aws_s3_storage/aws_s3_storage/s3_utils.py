@@ -3,7 +3,7 @@ import hashlib
 import mimetypes
 import os
 import uuid
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import boto3
 import frappe
@@ -108,7 +108,24 @@ def _build_file_url(key):
 	# A relative URL, so files keep working across domain changes, restores, clones
 	# and HTTP<->HTTPS. Frappe treats a "/api/method/..." URL as a remote file, so it
 	# never tries to read it from the local filesystem.
-	return f"/api/method/{DOWNLOAD_METHOD}?key={quote(key, safe='')}"
+	#
+	# Keep the path separators unencoded (safe="/"): encoding them to %2F invites a
+	# second encoding pass (%252F) when the URL is rendered, which then fails the
+	# public/ prefix check in download_file.
+	return f"/api/method/{DOWNLOAD_METHOD}?key={quote(key, safe='/')}"
+
+
+def _normalize_key(key):
+	# Strip up to two layers of URL-encoding so both cleanly-built keys and older
+	# double-encoded ones (%2F / %252F) resolve to the same canonical S3 key.
+	if not key:
+		return None
+	for _ in range(2):
+		decoded = unquote(key)
+		if decoded == key:
+			break
+		key = decoded
+	return key
 
 
 def _extract_key(file_url):
@@ -116,7 +133,7 @@ def _extract_key(file_url):
 	if not file_url:
 		return None
 	keys = parse_qs(urlparse(file_url).query).get("key")
-	return keys[0] if keys else None
+	return _normalize_key(keys[0]) if keys else None
 
 
 def _new_key(fname, is_private):
@@ -306,6 +323,7 @@ def download_file(key):
 	any other prefix. Public files are served to anyone; private files require read
 	permission on the owning File document.
 	"""
+	key = _normalize_key(key)
 	if not key or not key.startswith(SERVABLE_PREFIXES):
 		raise frappe.PermissionError
 
