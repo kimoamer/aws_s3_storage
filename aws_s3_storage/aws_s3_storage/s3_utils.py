@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import mimetypes
+import os
 import uuid
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -9,7 +10,7 @@ import frappe
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from frappe.model.document import Document
-from frappe.utils import cint, get_url
+from frappe.utils import cint
 
 # Whitelisted method used to serve files back from S3 via short-lived presigned URLs.
 DOWNLOAD_METHOD = "aws_s3_storage.aws_s3_storage.s3_utils.download_file"
@@ -18,8 +19,16 @@ DEFAULT_PRESIGNED_URL_EXPIRY = 3600
 # S3's hard limits for SigV4 presigned URL expiry.
 MIN_PRESIGNED_URL_EXPIRY = 60
 MAX_PRESIGNED_URL_EXPIRY = 604800  # 7 days
+# Only these prefixes are ever served to the web; everything else (e.g. backups/)
+# must never be reachable through the public download endpoint.
+SERVABLE_PREFIXES = ("public/", "private/")
 # S3 error codes that mean "object does not exist".
 _NOT_FOUND_CODES = {"404", "NoSuchKey", "NotFound"}
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
 
 
 def _boto_config(endpoint_url=None):
@@ -36,20 +45,35 @@ def _boto_config(endpoint_url=None):
 
 def get_s3_client():
 	settings = frappe.get_single("S3 Settings")
-	secret = settings.get_password("secret_access_key", raise_exception=False)
-	if not settings.bucket_name or not settings.access_key_id or not secret:
-		frappe.throw("S3 Settings are not fully configured")
+	if not settings.bucket_name:
+		frappe.throw("AWS S3 Bucket Name is not configured in S3 Settings")
 
 	endpoint_url = (settings.get("endpoint_url") or "").strip() or None
+	kwargs = {
+		"region_name": settings.region,
+		"endpoint_url": endpoint_url,
+		"config": _boto_config(endpoint_url),
+	}
 
-	return boto3.client(
-		"s3",
-		aws_access_key_id=settings.access_key_id,
-		aws_secret_access_key=secret,
-		region_name=settings.region,
-		endpoint_url=endpoint_url,
-		config=_boto_config(endpoint_url),
-	)
+	# Static keys are optional: when both are provided we use them, otherwise boto3
+	# falls back to its default credential chain (EC2 instance profile / IAM role,
+	# environment variables, ...). This lets a server on AWS avoid storing secrets.
+	access_key = settings.access_key_id
+	secret = settings.get_password("secret_access_key", raise_exception=False)
+	if access_key and secret:
+		kwargs["aws_access_key_id"] = access_key
+		kwargs["aws_secret_access_key"] = secret
+
+	return boto3.client("s3", **kwargs)
+
+
+def get_bucket():
+	return frappe.get_single("S3 Settings").bucket_name
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
 
 
 def _presigned_expiry(settings):
@@ -57,16 +81,17 @@ def _presigned_expiry(settings):
 	return max(MIN_PRESIGNED_URL_EXPIRY, min(expiry, MAX_PRESIGNED_URL_EXPIRY))
 
 
-def _upload_extra_args(settings, content=None):
+def _upload_extra_args(settings, content=None, storage_class=None):
 	"""Build ExtraArgs/put_object kwargs from the configurable S3 Settings.
 
-	``content`` (bytes) is only passed for single-shot put_object uploads so we
-	can attach a Content-MD5 header; multipart uploads (upload_file) compute their
-	own integrity checks, so it is omitted there.
+	``content`` (bytes) is only passed for single-shot put_object uploads so we can
+	attach a Content-MD5 header; multipart uploads (upload_file) and copy_object
+	compute their own integrity, so it is omitted there. ``storage_class`` overrides
+	the default attachment storage class (used for backups).
 	"""
 	extra = {}
 
-	storage_class = (settings.get("storage_class") or "").strip()
+	storage_class = (storage_class or settings.get("storage_class") or "").strip()
 	if storage_class and storage_class != "STANDARD":
 		extra["StorageClass"] = storage_class
 
@@ -80,9 +105,10 @@ def _upload_extra_args(settings, content=None):
 
 
 def _build_file_url(key):
-	# A stable, self-referential URL. It is absolute so Frappe treats the file as
-	# remote and never attempts to read/hash it from the local filesystem.
-	return f"{get_url()}/api/method/{DOWNLOAD_METHOD}?key={quote(key, safe='')}"
+	# A relative URL, so files keep working across domain changes, restores, clones
+	# and HTTP<->HTTPS. Frappe treats a "/api/method/..." URL as a remote file, so it
+	# never tries to read it from the local filesystem.
+	return f"/api/method/{DOWNLOAD_METHOD}?key={quote(key, safe='')}"
 
 
 def _extract_key(file_url):
@@ -93,8 +119,24 @@ def _extract_key(file_url):
 	return keys[0] if keys else None
 
 
-def _object_exists(s3, bucket, key, expected_size=None):
+def _new_key(fname, is_private):
+	prefix = "private" if cint(is_private) else "public"
+	return f"{prefix}/{uuid.uuid4().hex}/{fname}"
+
+
+def _swap_prefix(key, is_private):
+	"""Return the same key under the public/ or private/ prefix."""
+	new_prefix = "private" if cint(is_private) else "public"
+	head, sep, rest = key.partition("/")
+	if sep and head in ("public", "private"):
+		return f"{new_prefix}/{rest}"
+	return key
+
+
+def object_exists(key, expected_size=None, s3=None, bucket=None):
 	"""Return True only if the object exists and (optionally) matches expected_size."""
+	s3 = s3 or get_s3_client()
+	bucket = bucket or get_bucket()
 	try:
 		head = s3.head_object(Bucket=bucket, Key=key)
 	except ClientError as e:
@@ -106,6 +148,11 @@ def _object_exists(s3, bucket, key, expected_size=None):
 	return True
 
 
+# ---------------------------------------------------------------------------
+# Write / read
+# ---------------------------------------------------------------------------
+
+
 def write_file_to_s3(file_or_fname, content=None, content_type=None, is_private=0):
 	"""Frappe ``write_file`` hook.
 
@@ -115,10 +162,6 @@ def write_file_to_s3(file_or_fname, content=None, content_type=None, is_private=
 	* File doctype (frappe/core/doctype/file/file.py) -> ``write_file_to_s3(file_doc)``
 	* Legacy file_manager (frappe/utils/file_manager.py) ->
 	  ``write_file_to_s3(fname, content, content_type=..., is_private=...)``
-
-	In both cases we upload to S3 and return the dict Frappe expects
-	(``file_name``/``file_url``/``file_size``). For the File-document path we also
-	set ``file_url`` on the document itself, mirroring ``save_file_on_filesystem``.
 	"""
 	settings = frappe.get_single("S3 Settings")
 	if not settings.bucket_name:
@@ -141,31 +184,34 @@ def write_file_to_s3(file_or_fname, content=None, content_type=None, is_private=
 	if not content_type:
 		content_type = mimetypes.guess_type(fname)[0] or "application/octet-stream"
 
-	# A uuid segment guarantees a unique key without inspecting the call stack, so a
-	# new upload can never overwrite an existing object.
-	prefix = "private" if cint(is_private) else "public"
-	key = f"{prefix}/{uuid.uuid4().hex}/{fname}"
+	key = _new_key(fname, is_private)
 
 	s3 = get_s3_client()
+	bucket = settings.bucket_name
 	# No ACL is set: the bucket stays fully private and access is granted through
-	# presigned URLs (see download_file). This avoids AccessControlListNotSupported
-	# errors on buckets that have ACLs disabled (the modern S3 default).
+	# presigned URLs (see download_file).
 	s3.put_object(
-		Bucket=settings.bucket_name,
+		Bucket=bucket,
 		Key=key,
 		Body=content,
 		ContentType=content_type,
 		**_upload_extra_args(settings, content),
 	)
+	# If the surrounding transaction rolls back, the File record is never created,
+	# so remove the just-uploaded object to avoid orphaning it in S3. after_rollback
+	# is cleared on commit, so this is a no-op on success.
+	_delete_on_rollback(bucket, [key])
 
 	file_url = _build_file_url(key)
 	if file_doc is not None:
 		file_doc.file_url = file_url
+		file_doc.s3_key = key
 
 	return {
 		"file_name": fname,
 		"file_url": file_url,
 		"file_size": len(content),
+		"s3_key": key,
 	}
 
 
@@ -175,9 +221,8 @@ def read_file_from_s3(key):
 	Used by the File override to read content/thumbnails back without an HTTP
 	round-trip (which would fail permission checks for private files).
 	"""
-	settings = frappe.get_single("S3 Settings")
 	s3 = get_s3_client()
-	obj = s3.get_object(Bucket=settings.bucket_name, Key=key)
+	obj = s3.get_object(Bucket=get_bucket(), Key=key)
 	return obj["Body"].read()
 
 
@@ -195,25 +240,81 @@ def upload_thumbnail(key, content, content_type):
 	return _build_file_url(key)
 
 
+def copy_object(src_key, dst_key, settings=None, s3=None, bucket=None):
+	"""Server-side copy within the bucket, preserving the storage class."""
+	settings = settings or frappe.get_single("S3 Settings")
+	s3 = s3 or get_s3_client()
+	bucket = bucket or settings.bucket_name
+	s3.copy_object(
+		Bucket=bucket,
+		Key=dst_key,
+		CopySource={"Bucket": bucket, "Key": src_key},
+		MetadataDirective="COPY",
+		**_upload_extra_args(settings),
+	)
+
+
+def move_object_privacy(file_doc):
+	"""Move a File's S3 object(s) between the public/ and private/ prefixes when
+	``is_private`` changes, keeping the stored keys/URLs in sync.
+
+	The old objects are deleted only after commit; the new copies are removed if the
+	transaction rolls back.
+	"""
+	old_key = _extract_key(file_doc.file_url)
+	if not old_key:
+		return
+
+	new_key = _swap_prefix(old_key, file_doc.is_private)
+	if new_key == old_key:
+		return
+
+	settings = frappe.get_single("S3 Settings")
+	bucket = settings.bucket_name
+	s3 = get_s3_client()
+
+	new_keys, old_keys = [new_key], [old_key]
+	copy_object(old_key, new_key, settings=settings, s3=s3, bucket=bucket)
+	file_doc.file_url = _build_file_url(new_key)
+	file_doc.s3_key = new_key
+
+	old_thumb = _extract_key(file_doc.get("thumbnail_url"))
+	if old_thumb:
+		new_thumb = _swap_prefix(old_thumb, file_doc.is_private)
+		copy_object(old_thumb, new_thumb, settings=settings, s3=s3, bucket=bucket)
+		file_doc.thumbnail_url = _build_file_url(new_thumb)
+		file_doc.s3_thumbnail_key = new_thumb
+		new_keys.append(new_thumb)
+		old_keys.append(old_thumb)
+
+	_delete_on_rollback(bucket, new_keys)
+	_delete_after_commit(bucket, old_keys)
+
+
+# ---------------------------------------------------------------------------
+# Serving
+# ---------------------------------------------------------------------------
+
+
 @frappe.whitelist(allow_guest=True)
 def download_file(key):
 	"""Redirect to a short-lived presigned URL for an S3-stored file.
 
-	Public files are served to anyone; private files require the caller to have
-	read permission on the corresponding File document.
+	Only ``public/`` and ``private/`` objects are ever served — never backups or
+	any other prefix. Public files are served to anyone; private files require read
+	permission on the owning File document.
 	"""
-	if not key:
+	if not key or not key.startswith(SERVABLE_PREFIXES):
 		raise frappe.PermissionError
 
 	settings = frappe.get_single("S3 Settings")
 
 	if key.startswith("private/"):
-		# The key may belong to a File's main object or its thumbnail; either way
-		# access is governed by read permission on that File document.
-		pattern = f"%key={quote(key, safe='')}%"
-		file_name = frappe.db.get_value(
-			"File", {"file_url": ["like", pattern]}, "name"
-		) or frappe.db.get_value("File", {"thumbnail_url": ["like", pattern]}, "name")
+		# Exact-match lookup on the indexed key columns (no LIKE); the key may be a
+		# File's main object or its thumbnail.
+		file_name = frappe.db.get_value("File", {"s3_key": key}, "name") or frappe.db.get_value(
+			"File", {"s3_thumbnail_key": key}, "name"
+		)
 		if not file_name:
 			raise frappe.PermissionError
 		frappe.get_doc("File", file_name).check_permission("read")
@@ -248,48 +349,130 @@ def test_connection():
 	return f"Successfully connected to bucket '{settings.bucket_name}'."
 
 
+# ---------------------------------------------------------------------------
+# Deletion (deferred, reference-checked, retried)
+# ---------------------------------------------------------------------------
+
+
 def delete_file_from_s3(doc, only_thumbnail=False):
 	"""Frappe ``delete_file_data_content`` hook.
 
-	The S3 objects are removed only *after* the surrounding database transaction
-	commits. If the delete is rolled back, the callback is discarded and the files
-	are preserved — the File record and its object never drift apart.
+	Objects are removed only *after* the surrounding transaction commits, and only
+	when no other File still references the same key (deduplicated uploads share an
+	object). A rolled-back delete discards the removal entirely.
 	"""
 	keys = []
-	if not only_thumbnail and getattr(doc, "file_url", None):
-		keys.append(_extract_key(doc.file_url))
-	if getattr(doc, "thumbnail_url", None):
-		keys.append(_extract_key(doc.thumbnail_url))
+	if not only_thumbnail:
+		keys.append(getattr(doc, "s3_key", None) or _extract_key(getattr(doc, "file_url", None)))
+	keys.append(getattr(doc, "s3_thumbnail_key", None) or _extract_key(getattr(doc, "thumbnail_url", None)))
 	keys = [k for k in keys if k]
 
 	if not keys:
-		# No S3-managed object here (e.g. a file uploaded before this app was
-		# installed, still living on local disk). Since this hook fully replaces
-		# Frappe's on-disk cleanup, fall back to it so the file is not leaked.
+		# Local file (e.g. uploaded before this app was installed) — let Frappe
+		# remove it from disk so it is not leaked.
 		if hasattr(doc, "delete_file_from_filesystem"):
 			doc.delete_file_from_filesystem(only_thumbnail=only_thumbnail)
 		return
 
-	settings = frappe.get_single("S3 Settings")
-	if not settings.bucket_name:
+	_delete_after_commit(get_bucket(), keys, check_references=True)
+
+
+def _delete_after_commit(bucket, keys, check_references=False):
+	def _run():
+		_delete_keys(bucket, keys, check_references=check_references)
+
+	frappe.db.after_commit.add(_run)
+
+
+def _delete_on_rollback(bucket, keys):
+	def _run():
+		_delete_keys(bucket, keys)
+
+	frappe.db.after_rollback.add(_run)
+
+
+def _delete_keys(bucket, keys, check_references=False):
+	s3 = get_s3_client()
+	for key in keys:
+		# Never delete an object another File still points at (dedup / shared use).
+		if check_references and frappe.db.exists("File", {"s3_key": key}):
+			continue
+		try:
+			s3.delete_object(Bucket=bucket, Key=key)
+		except Exception as e:
+			frappe.logger().error(f"S3 Delete Error for {key}: {e}")
+			_queue_deletion(bucket, key, str(e))
+
+
+def _queue_deletion(bucket, key, error=None):
+	"""Record a failed deletion so a scheduler can retry it (avoids orphaned objects).
+
+	Runs the insert in a background job: this is usually called from inside an
+	after_commit/after_rollback callback, where an inline insert+commit would be a
+	re-entrant transaction.
+	"""
+	try:
+		frappe.enqueue(
+			"aws_s3_storage.aws_s3_storage.s3_utils._insert_deletion_row",
+			queue="short",
+			bucket=bucket,
+			key=key,
+			error=error,
+		)
+	except Exception as e:
+		frappe.logger().error(f"Could not queue S3 deletion for {key}: {e}")
+
+
+def _insert_deletion_row(bucket, key, error=None):
+	if frappe.db.exists("S3 Deletion Queue", {"s3_key": key}):
+		return
+	frappe.get_doc(
+		{
+			"doctype": "S3 Deletion Queue",
+			"bucket": bucket,
+			"s3_key": key,
+			"last_error": error,
+		}
+	).insert(ignore_permissions=True)
+	frappe.db.commit()
+
+
+def process_deletion_queue():
+	"""Scheduler job: retry queued S3 deletions."""
+	rows = frappe.get_all(
+		"S3 Deletion Queue",
+		filters={"status": "Pending"},
+		fields=["name", "bucket", "s3_key", "attempts"],
+		limit=200,
+	)
+	if not rows:
 		return
 
-	bucket = settings.bucket_name
+	s3 = get_s3_client()
+	for row in rows:
+		try:
+			s3.delete_object(Bucket=row.bucket, Key=row.s3_key)
+			frappe.delete_doc("S3 Deletion Queue", row.name, ignore_permissions=True, force=True)
+		except Exception as e:
+			attempts = (row.attempts or 0) + 1
+			frappe.db.set_value(
+				"S3 Deletion Queue",
+				row.name,
+				{
+					"attempts": attempts,
+					"last_error": str(e),
+					"status": "Failed" if attempts >= 10 else "Pending",
+				},
+			)
+	frappe.db.commit()
 
-	def _delete_committed_objects():
-		s3 = get_s3_client()
-		for key in keys:
-			try:
-				s3.delete_object(Bucket=bucket, Key=key)
-			except Exception as e:
-				frappe.logger().error(f"S3 Delete Error for {key}: {e}")
 
-	frappe.db.after_commit.add(_delete_committed_objects)
+# ---------------------------------------------------------------------------
+# Backups
+# ---------------------------------------------------------------------------
 
 
 def sync_backups_to_s3():
-	import os
-
 	settings = frappe.get_single("S3 Settings")
 	if not settings.bucket_name or not cint(settings.get("enable_backup_sync")):
 		return
@@ -299,7 +482,9 @@ def sync_backups_to_s3():
 		bucket = settings.bucket_name
 		site = frappe.local.site
 		backup_dir = frappe.get_site_path("private", "backups")
-		extra_args = _upload_extra_args(settings)
+		storage_class = settings.get("backup_storage_class") or settings.get("storage_class")
+		extra_args = _upload_extra_args(settings, storage_class=storage_class)
+		delete_local = cint(settings.get("delete_local_backup_after_sync"))
 
 		if not os.path.exists(backup_dir):
 			return
@@ -310,15 +495,16 @@ def sync_backups_to_s3():
 				continue
 
 			key = f"backups/{site}/{fname}"
-			# Idempotent: skip a backup already present in S3 with a matching size.
-			# This makes the sync self-healing — a missed run simply uploads whatever
-			# is still missing, rather than losing backups outside a 24h window.
-			if _object_exists(s3, bucket, key, expected_size=os.path.getsize(file_path)):
-				continue
+			local_size = os.path.getsize(file_path)
 
-			# upload_file streams from disk, handles multipart for large backups,
-			# and closes the file handle for us (no manual open()).
-			s3.upload_file(file_path, bucket, key, ExtraArgs=extra_args or None)
-			frappe.logger().info(f"Successfully uploaded backup {fname} to S3")
+			# Idempotent: skip a backup already present in S3 with a matching size.
+			if not object_exists(key, expected_size=local_size, s3=s3, bucket=bucket):
+				s3.upload_file(file_path, bucket, key, ExtraArgs=extra_args or None)
+				frappe.logger().info(f"Uploaded backup {fname} to S3")
+
+			# Only reclaim local space once the object is verified present in S3.
+			if delete_local and object_exists(key, expected_size=local_size, s3=s3, bucket=bucket):
+				os.remove(file_path)
+				frappe.logger().info(f"Removed local backup {fname} after successful S3 sync")
 	except Exception as e:
 		frappe.logger().error(f"S3 Backup Sync Error: {e}")

@@ -83,7 +83,8 @@ app_license = "mit"
 # ------------
 
 # before_install = "aws_s3_storage.install.before_install"
-# after_install = "aws_s3_storage.install.after_install"
+after_install = "aws_s3_storage.aws_s3_storage.install.after_install"
+after_migrate = "aws_s3_storage.aws_s3_storage.install.after_migrate"
 
 # Uninstallation
 # ------------
@@ -146,7 +147,10 @@ override_doctype_class = {"File": "aws_s3_storage.aws_s3_storage.file_override.S
 # Scheduled Tasks
 # ---------------
 
-scheduler_events = {"daily": ["aws_s3_storage.aws_s3_storage.s3_utils.sync_backups_to_s3"]}
+scheduler_events = {
+	"daily": ["aws_s3_storage.aws_s3_storage.s3_utils.sync_backups_to_s3"],
+	"hourly": ["aws_s3_storage.aws_s3_storage.s3_utils.process_deletion_queue"],
+}
 
 # AWS S3 Integration Hooks
 write_file = "aws_s3_storage.aws_s3_storage.s3_utils.write_file_to_s3"
