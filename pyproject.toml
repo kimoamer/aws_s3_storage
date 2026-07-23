@@ -1,7 +1,7 @@
 [project]
 name = "aws_s3_storage"
 authors = [
-    { name = "Innomate LLC", email = "frappe@example.com"}
+    { name = "Innomate LLC", email = "a.amer@innomate-tech.com"}
 ]
 description = "AWS S3 integration"
 requires-python = ">=3.10"
