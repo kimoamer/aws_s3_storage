@@ -187,6 +187,16 @@ class TestS3Settings(FrappeTestCase):
 		f = S3File({"doctype": "File", "file_url": s3_utils._build_file_url("public/uid/f.png")})
 		self.assertTrue(f.exists_on_disk())
 
+	def test_get_full_path_returns_url_for_s3_file(self):
+		# get_full_path must not push an /api/method URL through is_safe_path, which
+		# would abort the File save with "Cannot access file path".
+		from aws_s3_storage.aws_s3_storage.file_override import S3File
+
+		url = s3_utils._build_file_url("public/uid/f.png")
+		f = S3File({"doctype": "File", "file_url": url})
+		self.assertEqual(f.get_full_path(), url)
+		self.assertTrue(f.validate_file_on_disk())
+
 	@patch.object(s3_utils, "get_s3_client")
 	def test_delete_skips_key_still_referenced(self, mock_get_client):
 		s3 = MagicMock()
