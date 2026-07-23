@@ -33,6 +33,11 @@ def create_doctype():
                         {"fieldname": "access_key_id", "fieldtype": "Data", "label": "Access Key ID", "reqd": 1},
                         {"fieldname": "secret_access_key", "fieldtype": "Password", "label": "Secret Access Key", "reqd": 1},
                         {"fieldname": "endpoint_url", "fieldtype": "Data", "label": "Endpoint URL"},
+                        {"fieldname": "storage_class", "fieldtype": "Select", "label": "Storage Class",
+                         "options": "STANDARD\nSTANDARD_IA\nINTELLIGENT_TIERING\nONEZONE_IA\nGLACIER_IR\nDEEP_ARCHIVE", "default": "STANDARD"},
+                        {"fieldname": "presigned_url_expiry", "fieldtype": "Int", "label": "Presigned URL Expiry (seconds)", "default": "3600"},
+                        {"fieldname": "verify_upload_integrity", "fieldtype": "Check", "label": "Verify Upload Integrity", "default": "1"},
+                        {"fieldname": "enable_backup_sync", "fieldtype": "Check", "label": "Enable Daily Backup Sync", "default": "0"},
                     ],
                     "permissions": [{"role": "System Manager", "read": 1, "write": 1, "create": 1}]
                 })

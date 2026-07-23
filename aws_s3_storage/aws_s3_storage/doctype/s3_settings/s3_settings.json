@@ -10,7 +10,13 @@
   "region",
   "access_key_id",
   "secret_access_key",
-  "endpoint_url"
+  "endpoint_url",
+  "advanced_section",
+  "storage_class",
+  "presigned_url_expiry",
+  "verify_upload_integrity",
+  "column_break_adv",
+  "enable_backup_sync"
  ],
  "fields": [
   {
@@ -46,6 +52,44 @@
    "fieldname": "endpoint_url",
    "fieldtype": "Data",
    "label": "Endpoint URL"
+  },
+  {
+   "fieldname": "advanced_section",
+   "fieldtype": "Section Break",
+   "label": "Advanced"
+  },
+  {
+   "default": "STANDARD",
+   "description": "S3 storage tier for uploaded objects.",
+   "fieldname": "storage_class",
+   "fieldtype": "Select",
+   "label": "Storage Class",
+   "options": "STANDARD\nSTANDARD_IA\nINTELLIGENT_TIERING\nONEZONE_IA\nGLACIER_IR\nDEEP_ARCHIVE"
+  },
+  {
+   "default": "3600",
+   "description": "Lifetime of generated download links, in seconds (clamped to 60–604800).",
+   "fieldname": "presigned_url_expiry",
+   "fieldtype": "Int",
+   "label": "Presigned URL Expiry (seconds)"
+  },
+  {
+   "default": "1",
+   "description": "Send a Content-MD5 header so S3 rejects a corrupted upload instead of storing it.",
+   "fieldname": "verify_upload_integrity",
+   "fieldtype": "Check",
+   "label": "Verify Upload Integrity"
+  },
+  {
+   "fieldname": "column_break_adv",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "description": "When enabled, the daily scheduler uploads site backups to S3 (under backups/&lt;site&gt;/).",
+   "fieldname": "enable_backup_sync",
+   "fieldtype": "Check",
+   "label": "Enable Daily Backup Sync"
   }
  ],
  "grid_page_length": 50,

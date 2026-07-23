@@ -1,9 +1,12 @@
 # Copyright (c) 2026, Frappe and Contributors
 # See license.txt
 
+import base64
+import hashlib
 from unittest.mock import MagicMock, patch
 
 import frappe
+from botocore.exceptions import ClientError
 from frappe.tests.utils import FrappeTestCase
 
 from aws_s3_storage.aws_s3_storage import s3_utils
@@ -11,8 +14,15 @@ from aws_s3_storage.aws_s3_storage import s3_utils
 
 class TestS3Settings(FrappeTestCase):
 	def setUp(self):
+		# Deterministic settings regardless of other tests / rollbacks.
 		frappe.db.set_single_value("S3 Settings", "bucket_name", "test-bucket")
 		frappe.db.set_single_value("S3 Settings", "region", "us-east-1")
+		frappe.db.set_single_value("S3 Settings", "storage_class", "STANDARD")
+		frappe.db.set_single_value("S3 Settings", "verify_upload_integrity", 0)
+		frappe.db.set_single_value("S3 Settings", "presigned_url_expiry", 3600)
+		frappe.db.set_single_value("S3 Settings", "enable_backup_sync", 0)
+
+	# --- URL / key helpers -------------------------------------------------
 
 	def test_key_roundtrips_through_file_url(self):
 		key = "private/abc123/my report.pdf"
@@ -22,6 +32,8 @@ class TestS3Settings(FrappeTestCase):
 	def test_extract_key_ignores_non_s3_urls(self):
 		self.assertIsNone(s3_utils._extract_key("/files/foo.png"))
 		self.assertIsNone(s3_utils._extract_key(None))
+
+	# --- write_file_to_s3 --------------------------------------------------
 
 	@patch.object(s3_utils, "get_s3_client")
 	def test_write_public_file_sets_no_acl(self, mock_get_client):
@@ -73,12 +85,89 @@ class TestS3Settings(FrappeTestCase):
 		self.assertEqual(file_doc.file_url, result["file_url"])
 
 	@patch.object(s3_utils, "get_s3_client")
-	def test_delete_uses_key_from_url(self, mock_get_client):
+	def test_write_sends_content_md5_when_enabled(self, mock_get_client):
+		frappe.db.set_single_value("S3 Settings", "verify_upload_integrity", 1)
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+
+		content = b"integrity-please"
+		s3_utils.write_file_to_s3("f.bin", content)
+
+		_, kwargs = s3.put_object.call_args
+		expected = base64.b64encode(hashlib.md5(content, usedforsecurity=False).digest()).decode()
+		self.assertEqual(kwargs["ContentMD5"], expected)
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_write_omits_content_md5_when_disabled(self, mock_get_client):
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+
+		s3_utils.write_file_to_s3("f.bin", b"data")
+
+		_, kwargs = s3.put_object.call_args
+		self.assertNotIn("ContentMD5", kwargs)
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_write_applies_storage_class(self, mock_get_client):
+		frappe.db.set_single_value("S3 Settings", "storage_class", "STANDARD_IA")
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+
+		s3_utils.write_file_to_s3("f.bin", b"data")
+
+		_, kwargs = s3.put_object.call_args
+		self.assertEqual(kwargs["StorageClass"], "STANDARD_IA")
+
+	# --- download_file -----------------------------------------------------
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_download_uses_configured_expiry(self, mock_get_client):
+		frappe.db.set_single_value("S3 Settings", "presigned_url_expiry", 120)
+		s3 = MagicMock()
+		s3.generate_presigned_url.return_value = "https://signed.example/x"
+		mock_get_client.return_value = s3
+
+		s3_utils.download_file("public/xyz/pic.png")
+
+		_, kwargs = s3.generate_presigned_url.call_args
+		self.assertEqual(kwargs["ExpiresIn"], 120)
+		self.assertEqual(frappe.local.response["location"], "https://signed.example/x")
+
+	# --- delete_file_from_s3 (deferred to after-commit) --------------------
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_delete_is_deferred_until_after_commit(self, mock_get_client):
 		s3 = MagicMock()
 		mock_get_client.return_value = s3
 
 		key = "public/xyz/pic.png"
 		doc = frappe._dict(file_url=s3_utils._build_file_url(key), thumbnail_url=None)
-		s3_utils.delete_file_from_s3(doc)
 
+		captured = []
+		with patch.object(frappe.db.after_commit, "add", side_effect=captured.append):
+			s3_utils.delete_file_from_s3(doc)
+
+		# Nothing is deleted inline — only after the transaction commits.
+		s3.delete_object.assert_not_called()
+		self.assertEqual(len(captured), 1)
+
+		captured[0]()  # simulate the post-commit callback firing
 		s3.delete_object.assert_called_once_with(Bucket="test-bucket", Key=key)
+
+	# --- backup sync -------------------------------------------------------
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_backup_sync_noop_when_disabled(self, mock_get_client):
+		s3_utils.sync_backups_to_s3()
+		mock_get_client.assert_not_called()
+
+	def test_object_exists_checks_size(self):
+		s3 = MagicMock()
+		s3.head_object.return_value = {"ContentLength": 10}
+		self.assertTrue(s3_utils._object_exists(s3, "b", "k", expected_size=10))
+		self.assertFalse(s3_utils._object_exists(s3, "b", "k", expected_size=5))
+
+	def test_object_exists_false_on_missing(self):
+		s3 = MagicMock()
+		s3.head_object.side_effect = ClientError({"Error": {"Code": "404"}}, "HeadObject")
+		self.assertFalse(s3_utils._object_exists(s3, "b", "k"))

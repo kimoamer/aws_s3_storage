@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import mimetypes
 import uuid
 from urllib.parse import parse_qs, quote, urlparse
@@ -5,13 +7,19 @@ from urllib.parse import parse_qs, quote, urlparse
 import boto3
 import frappe
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from frappe.model.document import Document
 from frappe.utils import cint, get_url
 
 # Whitelisted method used to serve files back from S3 via short-lived presigned URLs.
 DOWNLOAD_METHOD = "aws_s3_storage.aws_s3_storage.s3_utils.download_file"
-# Lifetime of a generated presigned URL, in seconds.
-PRESIGNED_URL_EXPIRY = 3600
+# Fallback lifetime of a generated presigned URL, in seconds, when not configured.
+DEFAULT_PRESIGNED_URL_EXPIRY = 3600
+# S3's hard limits for SigV4 presigned URL expiry.
+MIN_PRESIGNED_URL_EXPIRY = 60
+MAX_PRESIGNED_URL_EXPIRY = 604800  # 7 days
+# S3 error codes that mean "object does not exist".
+_NOT_FOUND_CODES = {"404", "NoSuchKey", "NotFound"}
 
 
 def _boto_config(endpoint_url=None):
@@ -44,6 +52,33 @@ def get_s3_client():
 	)
 
 
+def _presigned_expiry(settings):
+	expiry = cint(settings.get("presigned_url_expiry")) or DEFAULT_PRESIGNED_URL_EXPIRY
+	return max(MIN_PRESIGNED_URL_EXPIRY, min(expiry, MAX_PRESIGNED_URL_EXPIRY))
+
+
+def _upload_extra_args(settings, content=None):
+	"""Build ExtraArgs/put_object kwargs from the configurable S3 Settings.
+
+	``content`` (bytes) is only passed for single-shot put_object uploads so we
+	can attach a Content-MD5 header; multipart uploads (upload_file) compute their
+	own integrity checks, so it is omitted there.
+	"""
+	extra = {}
+
+	storage_class = (settings.get("storage_class") or "").strip()
+	if storage_class and storage_class != "STANDARD":
+		extra["StorageClass"] = storage_class
+
+	if content is not None and cint(settings.get("verify_upload_integrity")):
+		# S3 validates the body against this digest and rejects a corrupted upload
+		# with BadDigest, so a damaged object is never silently stored.
+		digest = hashlib.md5(content, usedforsecurity=False).digest()
+		extra["ContentMD5"] = base64.b64encode(digest).decode()
+
+	return extra
+
+
 def _build_file_url(key):
 	# A stable, self-referential URL. It is absolute so Frappe treats the file as
 	# remote and never attempts to read/hash it from the local filesystem.
@@ -56,6 +91,19 @@ def _extract_key(file_url):
 		return None
 	keys = parse_qs(urlparse(file_url).query).get("key")
 	return keys[0] if keys else None
+
+
+def _object_exists(s3, bucket, key, expected_size=None):
+	"""Return True only if the object exists and (optionally) matches expected_size."""
+	try:
+		head = s3.head_object(Bucket=bucket, Key=key)
+	except ClientError as e:
+		if e.response.get("Error", {}).get("Code") in _NOT_FOUND_CODES:
+			return False
+		raise
+	if expected_size is not None:
+		return head.get("ContentLength") == expected_size
+	return True
 
 
 def write_file_to_s3(file_or_fname, content=None, content_type=None, is_private=0):
@@ -86,14 +134,15 @@ def write_file_to_s3(file_or_fname, content=None, content_type=None, is_private=
 	else:
 		fname = file_or_fname
 
-	# boto3 needs bytes; normalise so the reported file_size is accurate.
+	# boto3 needs bytes; normalise so the reported file_size and MD5 are accurate.
 	if isinstance(content, str):
 		content = content.encode("utf-8")
 
 	if not content_type:
 		content_type = mimetypes.guess_type(fname)[0] or "application/octet-stream"
 
-	# A uuid segment guarantees a unique key without inspecting the call stack.
+	# A uuid segment guarantees a unique key without inspecting the call stack, so a
+	# new upload can never overwrite an existing object.
 	prefix = "private" if cint(is_private) else "public"
 	key = f"{prefix}/{uuid.uuid4().hex}/{fname}"
 
@@ -106,6 +155,7 @@ def write_file_to_s3(file_or_fname, content=None, content_type=None, is_private=
 		Key=key,
 		Body=content,
 		ContentType=content_type,
+		**_upload_extra_args(settings, content),
 	)
 
 	file_url = _build_file_url(key)
@@ -147,7 +197,7 @@ def download_file(key):
 			"Key": key,
 			"ResponseContentDisposition": f'inline; filename="{key.rsplit("/", 1)[-1]}"',
 		},
-		ExpiresIn=PRESIGNED_URL_EXPIRY,
+		ExpiresIn=_presigned_expiry(settings),
 	)
 
 	frappe.local.response["type"] = "redirect"
@@ -170,35 +220,43 @@ def test_connection():
 
 
 def delete_file_from_s3(doc, only_thumbnail=False):
+	"""Frappe ``delete_file_data_content`` hook.
+
+	The S3 objects are removed only *after* the surrounding database transaction
+	commits. If the delete is rolled back, the callback is discarded and the files
+	are preserved — the File record and its object never drift apart.
+	"""
 	settings = frappe.get_single("S3 Settings")
 	if not settings.bucket_name:
 		return
 
-	s3 = get_s3_client()
+	keys = []
+	if not only_thumbnail and getattr(doc, "file_url", None):
+		keys.append(_extract_key(doc.file_url))
+	if getattr(doc, "thumbnail_url", None):
+		keys.append(_extract_key(doc.thumbnail_url))
+	keys = [k for k in keys if k]
+	if not keys:
+		return
+
 	bucket = settings.bucket_name
 
-	urls = []
-	if not only_thumbnail and getattr(doc, "file_url", None):
-		urls.append(doc.file_url)
-	if getattr(doc, "thumbnail_url", None):
-		urls.append(doc.thumbnail_url)
+	def _delete_committed_objects():
+		s3 = get_s3_client()
+		for key in keys:
+			try:
+				s3.delete_object(Bucket=bucket, Key=key)
+			except Exception as e:
+				frappe.logger().error(f"S3 Delete Error for {key}: {e}")
 
-	for url in urls:
-		key = _extract_key(url)
-		if not key:
-			continue
-		try:
-			s3.delete_object(Bucket=bucket, Key=key)
-		except Exception as e:
-			frappe.logger().error(f"S3 Delete Error for {key}: {e}")
+	frappe.db.after_commit.add(_delete_committed_objects)
 
 
 def sync_backups_to_s3():
 	import os
-	import time
 
 	settings = frappe.get_single("S3 Settings")
-	if not settings.bucket_name:
+	if not settings.bucket_name or not cint(settings.get("enable_backup_sync")):
 		return
 
 	try:
@@ -206,19 +264,26 @@ def sync_backups_to_s3():
 		bucket = settings.bucket_name
 		site = frappe.local.site
 		backup_dir = frappe.get_site_path("private", "backups")
+		extra_args = _upload_extra_args(settings)
 
 		if not os.path.exists(backup_dir):
 			return
 
-		cutoff = time.time() - 86400  # only sync files created within the last 24 hours
 		for fname in os.listdir(backup_dir):
 			file_path = os.path.join(backup_dir, fname)
-			if not os.path.isfile(file_path) or os.path.getmtime(file_path) <= cutoff:
+			if not os.path.isfile(file_path):
 				continue
+
 			key = f"backups/{site}/{fname}"
+			# Idempotent: skip a backup already present in S3 with a matching size.
+			# This makes the sync self-healing — a missed run simply uploads whatever
+			# is still missing, rather than losing backups outside a 24h window.
+			if _object_exists(s3, bucket, key, expected_size=os.path.getsize(file_path)):
+				continue
+
 			# upload_file streams from disk, handles multipart for large backups,
 			# and closes the file handle for us (no manual open()).
-			s3.upload_file(file_path, bucket, key)
+			s3.upload_file(file_path, bucket, key, ExtraArgs=extra_args or None)
 			frappe.logger().info(f"Successfully uploaded backup {fname} to S3")
 	except Exception as e:
 		frappe.logger().error(f"S3 Backup Sync Error: {e}")
