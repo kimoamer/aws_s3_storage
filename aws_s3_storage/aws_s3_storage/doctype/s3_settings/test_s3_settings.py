@@ -189,3 +189,75 @@ class TestS3Settings(FrappeTestCase):
 		s3 = MagicMock()
 		s3.head_object.side_effect = ClientError({"Error": {"Code": "404"}}, "HeadObject")
 		self.assertFalse(s3_utils._object_exists(s3, "b", "k"))
+
+	# --- server-side read / thumbnails -------------------------------------
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_read_file_from_s3(self, mock_get_client):
+		from io import BytesIO
+
+		s3 = MagicMock()
+		s3.get_object.return_value = {"Body": BytesIO(b"payload")}
+		mock_get_client.return_value = s3
+
+		self.assertEqual(s3_utils.read_file_from_s3("public/x/f.bin"), b"payload")
+		s3.get_object.assert_called_once_with(Bucket="test-bucket", Key="public/x/f.bin")
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_s3file_make_thumbnail_stores_private_thumbnail_in_s3(self, mock_get_client):
+		from io import BytesIO
+
+		from PIL import Image
+
+		from aws_s3_storage.aws_s3_storage.file_override import S3File
+
+		buf = BytesIO()
+		Image.new("RGB", (10, 10), "red").save(buf, format="PNG")
+		png = buf.getvalue()
+
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+
+		key = "private/uid/pic.png"
+		f = S3File({"doctype": "File", "file_name": "pic.png", "file_url": s3_utils._build_file_url(key)})
+		f.db_set = MagicMock()
+
+		with patch.object(s3_utils, "read_file_from_s3", return_value=png):
+			result = f.make_thumbnail()
+
+		# The thumbnail is uploaded as its own (still private) S3 object.
+		self.assertTrue(s3.put_object.called)
+		_, kwargs = s3.put_object.call_args
+		self.assertTrue(kwargs["Key"].startswith("private/uid/pic_small."))
+		# thumbnail_url is persisted and points back at our download endpoint.
+		f.db_set.assert_called_once()
+		self.assertEqual(f.db_set.call_args[0][0], "thumbnail_url")
+		self.assertIn("key=", result)
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_download_allows_thumbnail_key_via_permission(self, mock_get_client):
+		# A private thumbnail key lives in File.thumbnail_url, not file_url; the
+		# permission lookup must still find the owning File.
+		s3 = MagicMock()
+		s3.generate_presigned_url.return_value = "https://signed.example/thumb"
+		mock_get_client.return_value = s3
+
+		thumb_key = "private/uid/pic_small.png"
+		looked_up = {}
+
+		def fake_get_value(doctype, filters, fieldname):
+			looked_up.setdefault("filters", []).append(filters)
+			# Simulate: no File matches on file_url, one matches on thumbnail_url.
+			if "thumbnail_url" in filters:
+				return "FILE-0001"
+			return None
+
+		with (
+			patch.object(frappe.db, "get_value", side_effect=fake_get_value),
+			patch.object(frappe, "get_doc") as mock_get_doc,
+		):
+			s3_utils.download_file(thumb_key)
+
+		mock_get_doc.assert_called_once_with("File", "FILE-0001")
+		mock_get_doc.return_value.check_permission.assert_called_once_with("read")
+		self.assertEqual(frappe.local.response["location"], "https://signed.example/thumb")

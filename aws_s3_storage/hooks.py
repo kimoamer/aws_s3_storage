@@ -129,9 +129,7 @@ app_license = "mit"
 # ---------------
 # Override standard doctype classes
 
-# override_doctype_class = {
-# 	"ToDo": "custom_app.overrides.CustomToDo"
-# }
+override_doctype_class = {"File": "aws_s3_storage.aws_s3_storage.file_override.S3File"}
 
 # Document Events
 # ---------------
@@ -148,11 +146,7 @@ app_license = "mit"
 # Scheduled Tasks
 # ---------------
 
-scheduler_events = {
-	"daily": [
-		"aws_s3_storage.aws_s3_storage.s3_utils.sync_backups_to_s3"
-	]
-}
+scheduler_events = {"daily": ["aws_s3_storage.aws_s3_storage.s3_utils.sync_backups_to_s3"]}
 
 # AWS S3 Integration Hooks
 write_file = "aws_s3_storage.aws_s3_storage.s3_utils.write_file_to_s3"
@@ -239,4 +233,3 @@ write_file_keys = ["file_name", "file_url", "file_size"]
 # ------------
 # List of apps whose translatable strings should be excluded from this app's translations.
 # ignore_translatable_strings_from = []
-

@@ -169,6 +169,32 @@ def write_file_to_s3(file_or_fname, content=None, content_type=None, is_private=
 	}
 
 
+def read_file_from_s3(key):
+	"""Return the raw bytes of an S3 object, read server-side via boto3.
+
+	Used by the File override to read content/thumbnails back without an HTTP
+	round-trip (which would fail permission checks for private files).
+	"""
+	settings = frappe.get_single("S3 Settings")
+	s3 = get_s3_client()
+	obj = s3.get_object(Bucket=settings.bucket_name, Key=key)
+	return obj["Body"].read()
+
+
+def upload_thumbnail(key, content, content_type):
+	"""Upload a generated thumbnail and return the URL used to serve it."""
+	settings = frappe.get_single("S3 Settings")
+	s3 = get_s3_client()
+	s3.put_object(
+		Bucket=settings.bucket_name,
+		Key=key,
+		Body=content,
+		ContentType=content_type,
+		**_upload_extra_args(settings, content),
+	)
+	return _build_file_url(key)
+
+
 @frappe.whitelist(allow_guest=True)
 def download_file(key):
 	"""Redirect to a short-lived presigned URL for an S3-stored file.
@@ -182,9 +208,12 @@ def download_file(key):
 	settings = frappe.get_single("S3 Settings")
 
 	if key.startswith("private/"):
+		# The key may belong to a File's main object or its thumbnail; either way
+		# access is governed by read permission on that File document.
+		pattern = f"%key={quote(key, safe='')}%"
 		file_name = frappe.db.get_value(
-			"File", {"file_url": ["like", f"%key={quote(key, safe='')}%"]}, "name"
-		)
+			"File", {"file_url": ["like", pattern]}, "name"
+		) or frappe.db.get_value("File", {"thumbnail_url": ["like", pattern]}, "name")
 		if not file_name:
 			raise frappe.PermissionError
 		frappe.get_doc("File", file_name).check_permission("read")
