@@ -2,7 +2,7 @@ app_name = "aws_s3_storage"
 app_title = "Aws S3 Storage"
 app_publisher = "Innomate LLC"
 app_description = "AWS S3 integration"
-app_email = "frappe@example.com"
+app_email = "a.amer@innomate-tech.com"
 app_license = "mit"
 
 # Apps
