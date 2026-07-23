@@ -213,7 +213,28 @@ them into S3 and reclaim server space:
 
 The migration works in batches and is **resumable** — each migrated file records
 its S3 key and drops out of the pending set, so it is safe to stop and restart.
-Every file is verified in S3 (size check) before its local copy is removed.
+Every file is verified in S3 (size check) before its local copy is removed. Files
+whose content is missing on disk are skipped for the rest of the run rather than
+retried in a loop, and a local file shared by several File records is kept until
+the last of them has been migrated.
+
+**Recommended production rollout.** Do the first pass **without** deleting local
+files, verify, then reclaim space:
+
+1. Upload and rewrite records, keeping local copies:
+
+   ```bash
+   bench --site <site> execute \
+       aws_s3_storage.aws_s3_storage.migrate.run_migration \
+       --kwargs '{"batch_size": 100, "delete_local": 0}'
+   ```
+
+2. Spot-check that new uploads, downloads and deletes work for both a **public**
+   and a **private** file, and that uploading the same file twice behaves.
+3. Compare object counts/sizes between the local `files` folders and the bucket's
+   `public/` and `private/` prefixes.
+4. Only then re-run with `"delete_local": 1` (or use the UI button) to remove the
+   verified local copies.
 
 ---
 

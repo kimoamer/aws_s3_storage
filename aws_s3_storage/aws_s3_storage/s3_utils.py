@@ -288,7 +288,9 @@ def move_object_privacy(file_doc):
 		old_keys.append(old_thumb)
 
 	_delete_on_rollback(bucket, new_keys)
-	_delete_after_commit(bucket, old_keys)
+	# Only drop the old object(s) if no other File still references them (a shared /
+	# deduplicated object must survive).
+	_delete_after_commit(bucket, old_keys, check_references=True)
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +397,9 @@ def _delete_keys(bucket, keys, check_references=False):
 	s3 = get_s3_client()
 	for key in keys:
 		# Never delete an object another File still points at (dedup / shared use).
-		if check_references and frappe.db.exists("File", {"s3_key": key}):
+		if check_references and (
+			frappe.db.exists("File", {"s3_key": key}) or frappe.db.exists("File", {"s3_thumbnail_key": key})
+		):
 			continue
 		try:
 			s3.delete_object(Bucket=bucket, Key=key)
