@@ -350,6 +350,29 @@ class TestS3Settings(FrappeTestCase):
 		self.assertEqual(processed, ["F1", "F2"])
 		self.assertEqual(totals["missing"], 2)
 
+	def test_update_attached_field_repoints_matching_value(self):
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		doc = frappe._dict(attached_to_doctype="ToDo", attached_to_name="T1", attached_to_field="image")
+		saved = {}
+		with (
+			patch.object(frappe.db, "get_value", return_value="/files/old.png"),
+			patch.object(frappe.db, "set_value", side_effect=lambda dt, dn, f, v, **k: saved.update(v=v)),
+		):
+			migrate._update_attached_field(doc, "/files/old.png", "/api/method/x?key=public/u/old.png")
+		self.assertEqual(saved.get("v"), "/api/method/x?key=public/u/old.png")
+
+	def test_update_attached_field_skips_on_mismatch(self):
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		doc = frappe._dict(attached_to_doctype="ToDo", attached_to_name="T1", attached_to_field="image")
+		with (
+			patch.object(frappe.db, "get_value", return_value="/files/something-else.png"),
+			patch.object(frappe.db, "set_value") as set_value,
+		):
+			migrate._update_attached_field(doc, "/files/old.png", "/api/method/x?key=public/u/old.png")
+		set_value.assert_not_called()
+
 	# --- backup sync -------------------------------------------------------
 
 	@patch.object(s3_utils, "get_s3_client")

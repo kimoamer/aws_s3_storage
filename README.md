@@ -225,10 +225,21 @@ whose content is missing on disk are skipped for the rest of the run rather than
 retried in a loop, and a local file shared by several File records is kept until
 the last of them has been migrated.
 
+**What gets repointed.** Migration updates the `File` record (`file_url`/`s3_key`)
+**and** the linked document's own **Attach / Attach Image** field. Attachments
+shown in the sidebar (linked by `attached_to_doctype`/`_name`) keep working
+automatically. Links **embedded in rich text** — Text Editor / HTML fields, Print
+Formats, old timeline comments — are **not** rewritten. Run the read-only audit to
+find them and review them by hand before you rely on local files being gone:
+
+```bash
+bench --site <site> execute aws_s3_storage.aws_s3_storage.migrate.audit_local_links
+```
+
 **Recommended production rollout.** Do the first pass **without** deleting local
 files, verify, then reclaim space:
 
-1. Upload and rewrite records, keeping local copies:
+1. Migrate and rewrite records, keeping local copies:
 
    ```bash
    bench --site <site> execute \
@@ -238,10 +249,16 @@ files, verify, then reclaim space:
 
 2. Spot-check that new uploads, downloads and deletes work for both a **public**
    and a **private** file, and that uploading the same file twice behaves.
-3. Compare object counts/sizes between the local `files` folders and the bucket's
+3. Run `audit_local_links` and fix any embedded links it reports.
+4. Compare object counts/sizes between the local `files` folders and the bucket's
    `public/` and `private/` prefixes.
-4. Only then re-run with `"delete_local": 1` (or use the UI button) to remove the
-   verified local copies.
+5. Reclaim disk space by deleting the verified local copies of migrated files
+   (**not** by re-running the migration — migrated files have already left the
+   pending set):
+
+   ```bash
+   bench --site <site> execute aws_s3_storage.aws_s3_storage.migrate.cleanup_migrated_local_files
+   ```
 
 ---
 
