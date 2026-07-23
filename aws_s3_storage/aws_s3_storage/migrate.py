@@ -6,13 +6,17 @@ The app only sends *new* uploads to S3; files that existed before installation
 stay on disk. This tool moves them in resumable batches so you can actually
 reclaim server disk space.
 
-Run it from the UI (S3 Settings -> Migrate Local Files) or the bench console:
+Recommended first run — upload and rewrite records, but keep the local copies so
+you can verify counts/sizes before anything is deleted:
 
     bench --site <site> execute \
-        aws_s3_storage.aws_s3_storage.migrate.run_migration
+        aws_s3_storage.aws_s3_storage.migrate.run_migration \
+        --kwargs '{"batch_size": 100, "delete_local": 0}'
 
 Every migrated File gets its ``s3_key`` set, so the pending query naturally
-excludes it — the job is safe to stop and resume at any time.
+excludes it — the job is safe to stop and resume at any time. Files that can't be
+migrated (missing content) are skipped for the rest of the run instead of being
+retried in a loop.
 """
 
 import mimetypes
@@ -23,30 +27,22 @@ from frappe.utils import cint
 
 from aws_s3_storage.aws_s3_storage import s3_utils
 
+_PENDING_FILTERS = {
+	"is_folder": 0,
+	"s3_key": ["in", ["", None]],
+	"file_url": ["like", "%/files/%"],
+}
 
-def _pending_local_files(limit):
-	return frappe.get_all(
-		"File",
-		filters={
-			"is_folder": 0,
-			"s3_key": ["in", ["", None]],
-			"file_url": ["like", "%/files/%"],
-		},
-		pluck="name",
-		limit=limit,
-		order_by="creation asc",
-	)
+
+def _pending_local_files(limit, exclude=None):
+	filters = dict(_PENDING_FILTERS)
+	if exclude:
+		filters["name"] = ["not in", list(exclude)]
+	return frappe.get_all("File", filters=filters, pluck="name", limit=limit, order_by="creation asc")
 
 
 def count_pending():
-	return frappe.db.count(
-		"File",
-		{
-			"is_folder": 0,
-			"s3_key": ["in", ["", None]],
-			"file_url": ["like", "%/files/%"],
-		},
-	)
+	return frappe.db.count("File", dict(_PENDING_FILTERS))
 
 
 @frappe.whitelist()
@@ -68,9 +64,12 @@ def run_migration(batch_size=100, delete_local=1):
 	batch_size = cint(batch_size) or 100
 	delete_local = cint(delete_local)
 	totals = {"migrated": 0, "skipped": 0, "missing": 0, "failed": 0}
+	# Names that were processed but did not migrate — excluded from later batches so a
+	# batch of only missing/failed files can never loop forever.
+	done_not_migrated = set()
 
 	while True:
-		names = _pending_local_files(batch_size)
+		names = _pending_local_files(batch_size, exclude=done_not_migrated)
 		if not names:
 			break
 
@@ -82,6 +81,8 @@ def run_migration(batch_size=100, delete_local=1):
 				result = "failed"
 				frappe.logger().error(f"S3 migration failed for File {name}: {e}")
 			totals[result] = totals.get(result, 0) + 1
+			if result != "migrated":
+				done_not_migrated.add(name)
 
 		frappe.db.commit()
 
@@ -96,6 +97,8 @@ def migrate_file(name, delete_local=1):
 	if doc.is_folder or doc.get("s3_key") or s3_utils._extract_key(doc.file_url):
 		return "skipped"
 
+	old_main_url = doc.file_url
+
 	# Read the local content (get_content reads from disk for non-S3 files).
 	try:
 		content = doc.get_content()
@@ -109,9 +112,6 @@ def migrate_file(name, delete_local=1):
 	settings = frappe.get_single("S3 Settings")
 	bucket = settings.bucket_name
 	s3 = s3_utils.get_s3_client()
-
-	# Remember local paths before we rewrite the URLs.
-	local_paths = [_full_path(doc.file_url)]
 
 	new_key = s3_utils._new_key(doc.file_name, doc.is_private)
 	content_type = mimetypes.guess_type(doc.file_name)[0] or "application/octet-stream"
@@ -128,6 +128,7 @@ def migrate_file(name, delete_local=1):
 	update = {"file_url": s3_utils._build_file_url(new_key), "s3_key": new_key}
 
 	# Migrate a local thumbnail too, if any.
+	old_thumb_url = None
 	thumb_url = doc.get("thumbnail_url")
 	if thumb_url and "/files/" in thumb_url and not s3_utils._extract_key(thumb_url):
 		thumb_path = _full_path(thumb_url)
@@ -149,20 +150,30 @@ def migrate_file(name, delete_local=1):
 			)
 			update["thumbnail_url"] = s3_utils._build_file_url(thumb_key)
 			update["s3_thumbnail_key"] = thumb_key
-			local_paths.append(thumb_path)
+			old_thumb_url = thumb_url
 
 	doc.db_set(update, update_modified=False)
 	frappe.db.commit()
 
 	if delete_local:
-		for path in local_paths:
-			try:
-				if path and os.path.exists(path):
-					os.remove(path)
-			except Exception as e:
-				frappe.logger().error(f"S3 migration: could not remove local file {path}: {e}")
+		# A shared upload (several File rows pointing at one local file) must keep the
+		# local copy until the last referencing record has been migrated.
+		_remove_local_if_unreferenced("file_url", old_main_url)
+		if old_thumb_url:
+			_remove_local_if_unreferenced("thumbnail_url", old_thumb_url)
 
 	return "migrated"
+
+
+def _remove_local_if_unreferenced(field, url):
+	if not url or frappe.db.exists("File", {field: url}):
+		return
+	path = _full_path(url)
+	try:
+		if path and os.path.exists(path):
+			os.remove(path)
+	except Exception as e:
+		frappe.logger().error(f"S3 migration: could not remove local file {path}: {e}")
 
 
 def _full_path(file_url):

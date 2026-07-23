@@ -264,6 +264,61 @@ class TestS3Settings(FrappeTestCase):
 		self.assertIn("thumbnail_url", saved)
 		self.assertIn("s3_thumbnail_key", saved)
 
+	# --- dedup s3_key backfill / shared-object safety ----------------------
+
+	def test_backfill_s3_keys_from_url(self):
+		from aws_s3_storage.aws_s3_storage.file_override import S3File
+
+		f = S3File(
+			{
+				"doctype": "File",
+				"file_url": s3_utils._build_file_url("public/uid/f.png"),
+				"thumbnail_url": s3_utils._build_file_url("public/uid/f_small.png"),
+			}
+		)
+		f._backfill_s3_keys()
+		self.assertEqual(f.s3_key, "public/uid/f.png")
+		self.assertEqual(f.s3_thumbnail_key, "public/uid/f_small.png")
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_delete_skips_key_referenced_as_thumbnail(self, mock_get_client):
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+
+		def exists(doctype, filters):
+			return "s3_thumbnail_key" in filters  # still referenced as someone's thumbnail
+
+		with patch.object(frappe.db, "exists", side_effect=exists):
+			s3_utils._delete_keys("test-bucket", ["public/uid/f.png"], check_references=True)
+		s3.delete_object.assert_not_called()
+
+	# --- migration safety --------------------------------------------------
+
+	def test_run_migration_does_not_loop_on_missing(self):
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		names = ["F1", "F2"]
+		processed = []
+
+		def fake_pending(limit, exclude=None):
+			exclude = set(exclude or [])
+			return [n for n in names if n not in exclude]
+
+		def fake_migrate(name, delete_local=1):
+			processed.append(name)
+			return "missing"
+
+		with (
+			patch.object(migrate, "_pending_local_files", side_effect=fake_pending),
+			patch.object(migrate, "migrate_file", side_effect=fake_migrate),
+			patch.object(frappe.db, "commit"),
+		):
+			totals = migrate.run_migration()
+
+		# Each file processed exactly once, then the run terminates (no infinite loop).
+		self.assertEqual(processed, ["F1", "F2"])
+		self.assertEqual(totals["missing"], 2)
+
 	# --- backup sync -------------------------------------------------------
 
 	@patch.object(s3_utils, "get_s3_client")

@@ -17,6 +17,23 @@ class S3File(File):
 	deduplication. Each of those is routed through boto3 instead.
 	"""
 
+	def before_insert(self):
+		super().before_insert()
+		# Deduplication: when Frappe reuses an existing S3 object for a duplicate
+		# content hash it copies file_url but not s3_key. Backfill the key columns so
+		# permission lookups and reference-checked deletes still work for this record.
+		self._backfill_s3_keys()
+
+	def _backfill_s3_keys(self):
+		if not self.get("s3_key"):
+			key = s3_utils._extract_key(self.file_url)
+			if key:
+				self.s3_key = key
+		if not self.get("s3_thumbnail_key") and self.get("thumbnail_url"):
+			thumb_key = s3_utils._extract_key(self.thumbnail_url)
+			if thumb_key:
+				self.s3_thumbnail_key = thumb_key
+
 	def get_content(self) -> bytes:
 		if not self.get("content") and self.file_url:
 			key = s3_utils._extract_key(self.file_url)
