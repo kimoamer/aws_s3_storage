@@ -16,7 +16,9 @@
   "presigned_url_expiry",
   "verify_upload_integrity",
   "column_break_adv",
-  "enable_backup_sync"
+  "enable_backup_sync",
+  "backup_storage_class",
+  "delete_local_backup_after_sync"
  ],
  "fields": [
   {
@@ -34,18 +36,18 @@
    "reqd": 1
   },
   {
+   "description": "Leave blank to use the server's EC2 IAM role / instance profile (recommended on AWS).",
    "fieldname": "access_key_id",
    "fieldtype": "Data",
    "in_list_view": 1,
-   "label": "Access Key ID",
-   "reqd": 1
+   "label": "Access Key ID"
   },
   {
+   "description": "Leave blank when using an IAM role. Required only if an Access Key ID is set.",
    "fieldname": "secret_access_key",
    "fieldtype": "Password",
    "in_list_view": 1,
-   "label": "Secret Access Key",
-   "reqd": 1
+   "label": "Secret Access Key"
   },
   {
    "description": "Optional. Set for S3-compatible services (MinIO, DigitalOcean Spaces, Wasabi). Leave blank for AWS S3.",
@@ -90,6 +92,23 @@
    "fieldname": "enable_backup_sync",
    "fieldtype": "Check",
    "label": "Enable Daily Backup Sync"
+  },
+  {
+   "default": "STANDARD",
+   "depends_on": "enable_backup_sync",
+   "description": "Storage tier for backups (independent of attachments — e.g. STANDARD_IA or GLACIER_IR for cheaper cold storage).",
+   "fieldname": "backup_storage_class",
+   "fieldtype": "Select",
+   "label": "Backup Storage Class",
+   "options": "STANDARD\nSTANDARD_IA\nINTELLIGENT_TIERING\nONEZONE_IA\nGLACIER_IR\nDEEP_ARCHIVE"
+  },
+  {
+   "default": "0",
+   "depends_on": "enable_backup_sync",
+   "description": "Delete the local backup file after it is verified present in S3 (reclaims server disk space).",
+   "fieldname": "delete_local_backup_after_sync",
+   "fieldtype": "Check",
+   "label": "Delete Local Backup After Sync"
   }
  ],
  "grid_page_length": 50,

@@ -19,5 +19,30 @@ frappe.ui.form.on("S3 Settings", {
 				},
 			});
 		});
+
+		frm.add_custom_button(__("Migrate Local Files"), () => {
+			frappe.confirm(
+				__(
+					"Upload files currently stored on local disk to S3 in the background? Local copies are removed only after each object is verified in S3."
+				),
+				() => {
+					frappe.call({
+						method: "aws_s3_storage.aws_s3_storage.migrate.start_migration",
+						freeze: true,
+						callback: (r) => {
+							if (!r.exc) {
+								frappe.msgprint({
+									title: __("Migration started"),
+									message: __("Queued in the background. Pending files: {0}", [
+										(r.message && r.message.pending) || 0,
+									]),
+									indicator: "blue",
+								});
+							}
+						},
+					});
+				}
+			);
+		});
 	},
 });

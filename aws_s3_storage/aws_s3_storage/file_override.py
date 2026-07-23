@@ -10,12 +10,11 @@ from aws_s3_storage.aws_s3_storage import s3_utils
 
 
 class S3File(File):
-	"""File doctype override that reads content back from S3.
+	"""File doctype override that keeps S3-backed files consistent.
 
-	Frappe reads file content from the local disk (``get_content``) and fetches
-	remote files over HTTP (``make_thumbnail``). Neither works for our private S3
-	objects — the HTTP path is a session-less self-request that fails the
-	permission check — so both are routed through boto3 instead.
+	Frappe reads content from local disk, fetches remote files over HTTP, skips
+	moving remote files when privacy changes, and can't detect S3 objects for
+	deduplication. Each of those is routed through boto3 instead.
 	"""
 
 	def get_content(self) -> bytes:
@@ -30,6 +29,22 @@ class S3File(File):
 					self._content = content
 				return self._content
 		return super().get_content()
+
+	def exists_on_disk(self):
+		# An S3-backed record is considered "present" so Frappe's content-hash
+		# deduplication reuses the existing object instead of re-uploading it.
+		if s3_utils._extract_key(self.file_url):
+			return True
+		return super().exists_on_disk()
+
+	def handle_is_private_changed(self):
+		# Frappe's default skips remote files (ours are remote), which would leave the
+		# object under the wrong prefix and, worse, a "private" record reachable under
+		# public/. Move the object to match the new privacy instead.
+		if s3_utils._extract_key(self.file_url):
+			s3_utils.move_object_privacy(self)
+			return
+		return super().handle_is_private_changed()
 
 	def make_thumbnail(
 		self,
@@ -62,13 +77,12 @@ class S3File(File):
 		buffer = BytesIO()
 		image.save(buffer, format=image_format)
 
-		# Store the thumbnail next to its source object, preserving privacy
-		# (a private image keeps its "private/" prefix, so it is not exposed).
+		# Store the thumbnail next to its source object, preserving privacy.
 		base, dot, ext = key.rpartition(".")
 		thumb_key = f"{base}_{suffix}.{ext}" if dot else f"{key}_{suffix}"
 		content_type = Image.MIME.get(image_format, "image/png")
 
 		thumbnail_url = s3_utils.upload_thumbnail(thumb_key, buffer.getvalue(), content_type)
 		if set_as_thumbnail:
-			self.db_set("thumbnail_url", thumbnail_url)
+			self.db_set({"thumbnail_url": thumbnail_url, "s3_thumbnail_key": thumb_key})
 		return thumbnail_url
