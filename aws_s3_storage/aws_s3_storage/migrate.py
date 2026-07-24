@@ -20,6 +20,7 @@ are skipped for the rest of a run instead of looping. Uploads stream from disk
 
 import mimetypes
 import os
+import time
 
 import frappe
 from frappe.utils import cint, now_datetime
@@ -28,6 +29,10 @@ from aws_s3_storage.aws_s3_storage import s3_utils
 
 STATUS_DOCTYPE = "S3 Migration Status"
 ERROR_DOCTYPE = "S3 Migration Error"
+# Each background job works for at most this long, then re-enqueues itself, so a run
+# of thousands of files never hits the platform's per-job timeout (~1500s).
+_TIME_BUDGET_SECONDS = 1000
+_MAX_FILES_PER_JOB = 400
 _STATUS_FIELDS = (
 	"status",
 	"total_files",
@@ -170,30 +175,83 @@ def start_migration(batch_size=100, delete_local=0):
 		last_file=None,
 		error_message=None,
 	)
-	frappe.enqueue(
-		"aws_s3_storage.aws_s3_storage.migrate.run_migration",
-		queue="long",
-		timeout=0,
-		batch_size=cint(batch_size),
-		delete_local=cint(delete_local),
-	)
+	_clear_errors()
+	_enqueue_run(cint(batch_size), cint(delete_local), _TIME_BUDGET_SECONDS)
 	return get_migration_status()
 
 
-def run_migration(batch_size=100, delete_local=0):
-	"""Migrate all pending local files to S3 in batches, committing between them."""
+def _enqueue_run(batch_size, delete_local, time_budget):
+	frappe.enqueue(
+		"aws_s3_storage.aws_s3_storage.migrate.run_migration",
+		queue="long",
+		timeout=(time_budget + 300) if time_budget else 0,
+		batch_size=batch_size,
+		delete_local=delete_local,
+		time_budget=time_budget,
+	)
+
+
+def _read_totals():
+	doc = frappe.get_single(STATUS_DOCTYPE)
+	return {
+		"migrated": cint(doc.migrated_files),
+		"failed": cint(doc.failed_files),
+		"missing": cint(doc.missing_files),
+		"skipped": cint(doc.skipped_files),
+	}
+
+
+def run_migration(batch_size=100, delete_local=0, time_budget=0):
+	"""Migrate pending local files to S3.
+
+	``time_budget=0`` (the default — e.g. a direct ``bench execute`` call) runs to
+	completion in this process and only ever leaves the status "Completed" or
+	"Failed". A positive budget (used by the S3 Settings button) works for that many
+	seconds, then re-enqueues itself, so a run of thousands of files on a managed
+	platform never hits the worker's per-job timeout.
+
+	Counts accumulate in the status doctype; failed/missing files (recorded in the
+	error log) are skipped so the run always makes progress and terminates.
+	"""
 	batch_size = cint(batch_size) or 100
 	delete_local = cint(delete_local)
-	totals = {"migrated": 0, "skipped": 0, "missing": 0, "failed": 0}
-	# Names processed but not migrated — excluded from later batches so a batch of
-	# only missing/failed files can never loop forever.
-	done_not_migrated = set()
+	time_budget = cint(time_budget)
 
-	_set_status(status="Running", started_at=now_datetime(), error_message=None)
-	_clear_errors()
+	status = frappe.db.get_single_value(STATUS_DOCTYPE, "status")
+	if status not in ("Running", "Queued"):
+		# Fresh standalone run (console, or first invocation): reset counters.
+		_set_status(
+			status="Running",
+			started_at=now_datetime(),
+			finished_at=None,
+			error_message=None,
+			total_files=count_pending(),
+			processed_files=0,
+			migrated_files=0,
+			failed_files=0,
+			missing_files=0,
+			skipped_files=0,
+			last_file=None,
+		)
+		_clear_errors()
+	elif status == "Queued":
+		_set_status(status="Running", started_at=now_datetime())
+
+	totals = _read_totals()
+	# Persisted across chained jobs via the error log, so failed/missing files are
+	# not retried forever.
+	done_not_migrated = set(frappe.get_all(ERROR_DOCTYPE, pluck="file"))
+
+	started = time.monotonic()
+	processed_this_job = 0
+
+	def _budget_reached():
+		return bool(time_budget) and (
+			processed_this_job >= _MAX_FILES_PER_JOB or (time.monotonic() - started) >= time_budget
+		)
+
 	try:
-		processed = 0
-		while True:
+		while not _budget_reached():
 			names = _pending_local_files(batch_size, exclude=done_not_migrated)
 			if not names:
 				break
@@ -214,21 +272,26 @@ def run_migration(batch_size=100, delete_local=0):
 					done_not_migrated.add(name)
 					if result in ("failed", "missing"):
 						_record_error(name, result.capitalize(), err)
-				processed += 1
-				if processed % 25 == 0:
-					_write_progress(totals, name)
+				processed_this_job += 1
+				if _budget_reached():
+					break
 
 			frappe.db.commit()
 			_write_progress(totals, names[-1])
-
-		_set_status(status="Completed", finished_at=now_datetime())
 	except Exception as e:
 		frappe.db.rollback()
 		_set_status(status="Failed", finished_at=now_datetime(), error_message=str(e))
 		frappe.logger().error(f"S3 migration aborted: {e}")
 		raise
 
-	frappe.logger().info(f"S3 migration finished: {totals}")
+	# In budgeted (button) mode, hand off to a fresh job if work remains. A
+	# run-to-completion call has already drained everything it can.
+	if time_budget and _pending_local_files(1, exclude=done_not_migrated):
+		_enqueue_run(batch_size, delete_local, time_budget)
+	else:
+		_set_status(status="Completed", finished_at=now_datetime())
+
+	frappe.logger().info(f"S3 migration job done: {totals} (+{processed_this_job} this job)")
 	return totals
 
 
