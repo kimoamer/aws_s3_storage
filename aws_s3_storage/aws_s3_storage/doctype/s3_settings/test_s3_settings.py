@@ -87,6 +87,34 @@ class TestS3Settings(FrappeTestCase):
 		self.assertEqual(kwargs["aws_access_key_id"], "AKIA")
 		self.assertEqual(kwargs["aws_secret_access_key"], "secret")
 
+	# --- master enable switch ----------------------------------------------
+
+	def test_is_enabled_defaults_on(self):
+		self.assertTrue(s3_utils._is_enabled(frappe._dict()))  # unset -> enabled
+		self.assertTrue(s3_utils._is_enabled(frappe._dict(enabled=1)))
+		self.assertFalse(s3_utils._is_enabled(frappe._dict(enabled=0)))
+
+	def test_write_falls_back_to_local_when_disabled(self):
+		frappe.db.set_single_value("S3 Settings", "enabled", 0)
+		with (
+			patch.object(s3_utils, "get_s3_client") as client,
+			patch.object(s3_utils, "_save_to_filesystem", return_value={"file_url": "/files/x"}) as fallback,
+		):
+			result = s3_utils.write_file_to_s3("x.txt", b"data")
+		client.assert_not_called()
+		fallback.assert_called_once()
+		self.assertEqual(result, {"file_url": "/files/x"})
+
+	def test_write_falls_back_to_local_when_no_bucket(self):
+		frappe.db.set_single_value("S3 Settings", "bucket_name", "")
+		with (
+			patch.object(s3_utils, "get_s3_client") as client,
+			patch.object(s3_utils, "_save_to_filesystem", return_value={"file_url": "/files/x"}) as fallback,
+		):
+			s3_utils.write_file_to_s3("x.txt", b"data")
+		client.assert_not_called()
+		fallback.assert_called_once()
+
 	# --- write_file_to_s3 --------------------------------------------------
 
 	@patch.object(s3_utils, "get_s3_client")
@@ -374,6 +402,29 @@ class TestS3Settings(FrappeTestCase):
 		):
 			migrate._update_attached_field(doc, "/files/old.png", "/api/method/x?key=public/u/old.png")
 		set_value.assert_not_called()
+
+	def test_record_error_inserts_row(self):
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		inserted = {}
+
+		class FakeDoc:
+			def insert(self, ignore_permissions=False):
+				inserted["done"] = True
+
+		with (
+			patch.object(frappe.db, "get_value", return_value="/files/x"),
+			patch.object(frappe, "get_doc", return_value=FakeDoc()) as get_doc,
+			patch.object(frappe.db, "commit"),
+		):
+			migrate._record_error("F1", "Failed", "boom")
+
+		payload = get_doc.call_args[0][0]
+		self.assertEqual(payload["doctype"], "S3 Migration Error")
+		self.assertEqual(payload["file"], "F1")
+		self.assertEqual(payload["reason"], "Failed")
+		self.assertEqual(payload["error"], "boom")
+		self.assertTrue(inserted["done"])
 
 	def test_update_attached_field_raises_on_failure(self):
 		# A failed field update must propagate so the file is rolled back, not

@@ -71,6 +71,23 @@ def get_bucket():
 	return frappe.get_single("S3 Settings").bucket_name
 
 
+def _is_enabled(settings):
+	# Default to enabled: a value that was never set (None) counts as on, only an
+	# explicit unchecked (0) disables S3 storage.
+	value = settings.get("enabled")
+	return True if value is None else bool(cint(value))
+
+
+def _save_to_filesystem(file_or_fname, content, content_type, is_private):
+	"""Fallback to Frappe's default local storage (integration disabled/unconfigured)."""
+	if isinstance(file_or_fname, Document):
+		return file_or_fname.save_file_on_filesystem()
+
+	from frappe.utils.file_manager import save_file_on_filesystem
+
+	return save_file_on_filesystem(file_or_fname, content, content_type=content_type, is_private=is_private)
+
+
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
@@ -181,8 +198,10 @@ def write_file_to_s3(file_or_fname, content=None, content_type=None, is_private=
 	  ``write_file_to_s3(fname, content, content_type=..., is_private=...)``
 	"""
 	settings = frappe.get_single("S3 Settings")
-	if not settings.bucket_name:
-		frappe.throw("AWS S3 Bucket Name is not configured in S3 Settings")
+	# Master switch: when disabled — or before a bucket is configured — fall back to
+	# Frappe's default local storage instead of failing the upload.
+	if not _is_enabled(settings) or not settings.bucket_name:
+		return _save_to_filesystem(file_or_fname, content, content_type, is_private)
 
 	file_doc = None
 	if isinstance(file_or_fname, Document):

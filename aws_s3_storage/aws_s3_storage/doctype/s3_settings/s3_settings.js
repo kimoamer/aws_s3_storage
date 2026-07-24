@@ -129,9 +129,29 @@ frappe.ui.form.on("S3 Settings", {
 					method: "aws_s3_storage.aws_s3_storage.migrate.get_migration_status",
 					callback: (r) => {
 						const s = r.message || {};
+						const errors = s.errors || [];
+						let errorHtml = "";
+						if (errors.length) {
+							const rows = errors
+								.map(
+									(e) =>
+										`<tr><td>${frappe.utils.escape_html(e.file || "")}</td>` +
+										`<td>${frappe.utils.escape_html(e.reason || "")}</td>` +
+										`<td>${frappe.utils.escape_html(e.error || "")}</td></tr>`
+								)
+								.join("");
+							errorHtml =
+								`<p class="text-muted" style="margin-top:10px">${__(
+									"Most recent failures (full list: S3 Migration Error):"
+								)}</p>` +
+								`<table class="table table-bordered"><thead><tr>
+									<th>${__("File")}</th><th>${__("Reason")}</th><th>${__("Error")}</th>
+								</tr></thead><tbody>${rows}</tbody></table>`;
+						}
 						frappe.msgprint({
 							title: __("Migration Status"),
-							message: `<table class="table table-bordered">
+							message:
+								`<table class="table table-bordered">
 								<tr><td>${__("Status")}</td><td><b>${frappe.utils.escape_html(s.status || "Idle")}</b></td></tr>
 								<tr><td>${__("Total")}</td><td>${s.total_files || 0}</td></tr>
 								<tr><td>${__("Migrated")}</td><td>${s.migrated_files || 0}</td></tr>
@@ -139,8 +159,9 @@ frappe.ui.form.on("S3 Settings", {
 								<tr><td>${__("Missing")}</td><td>${s.missing_files || 0}</td></tr>
 								<tr><td>${__("Pending")}</td><td>${s.pending || 0}</td></tr>
 								<tr><td>${__("Last file")}</td><td>${frappe.utils.escape_html(s.last_file || "")}</td></tr>
-								</table>
-								<p class="text-muted">${__("Re-run step 1 to retry failed / remaining files.")}</p>`,
+								</table>` +
+								errorHtml +
+								`<p class="text-muted">${__("Re-run step 1 to retry failed / remaining files.")}</p>`,
 							indicator: s.status === "Running" ? "blue" : "green",
 						});
 					},
