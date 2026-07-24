@@ -374,6 +374,14 @@ class TestS3Settings(FrappeTestCase):
 
 	# --- migration safety --------------------------------------------------
 
+	def test_scheduled_migration_noop_when_disabled(self):
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		frappe.db.set_single_value("S3 Settings", "enable_scheduled_migration", 0)
+		with patch.object(migrate, "run_migration") as run_migration:
+			migrate.scheduled_migration()
+		run_migration.assert_not_called()
+
 	def test_run_migration_does_not_loop_on_missing(self):
 		from aws_s3_storage.aws_s3_storage import migrate
 

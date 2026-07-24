@@ -224,6 +224,23 @@ doctype (file, reason, error) — the Migration Status dialog shows the most rec
 and the full list is in that doctype's list view. The list is cleared at the start
 of each run.
 
+#### Migrate a bit each day (scheduled)
+
+For very large libraries you can drip-feed the migration instead of one long run.
+Under **S3 Settings → Scheduled Migration**:
+
+| Field | Description |
+| --- | --- |
+| **Enable Daily Auto-Migration** | The daily scheduler migrates the next batch automatically, until none remain. |
+| **Files Per Day** | Cap per day (default 5000). At 5000/day, 100k files finish in ~20 days. |
+| **Delete Local After Migration** | Delete each local copy right after it's migrated and verified in S3, so disk frees up **as files move**. |
+
+Progress accumulates across days in **Migration Status**. It never overlaps a
+manual run, and pauses (`Idle`) between days. Turn on **Delete Local After
+Migration** only after you've verified a sample (attachments, images, print
+formats) — until then, leave it off and reclaim space later with **Delete Verified
+Local Copies**. Requires the bench scheduler to be enabled.
+
 The migration runs in batches and is **resumable** — each migrated file records
 its S3 key and drops out of the pending set, so it is safe to stop and restart.
 Uploads **stream from disk** (multipart), so large files do not have to fit in

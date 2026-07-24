@@ -19,7 +19,11 @@
   "column_break_adv",
   "enable_backup_sync",
   "backup_storage_class",
-  "delete_local_backup_after_sync"
+  "delete_local_backup_after_sync",
+  "migration_section",
+  "enable_scheduled_migration",
+  "daily_migration_limit",
+  "auto_delete_after_migration"
  ],
  "fields": [
   {
@@ -117,6 +121,34 @@
    "fieldname": "delete_local_backup_after_sync",
    "fieldtype": "Check",
    "label": "Delete Local Backup After Sync"
+  },
+  {
+   "fieldname": "migration_section",
+   "fieldtype": "Section Break",
+   "label": "Scheduled Migration"
+  },
+  {
+   "default": "0",
+   "description": "Migrate a capped number of pre-existing local files to S3 automatically every day, until none remain. Progress is visible in the 'Migration Status' button.",
+   "fieldname": "enable_scheduled_migration",
+   "fieldtype": "Check",
+   "label": "Enable Daily Auto-Migration"
+  },
+  {
+   "default": "5000",
+   "depends_on": "enable_scheduled_migration",
+   "description": "Maximum files to migrate per day.",
+   "fieldname": "daily_migration_limit",
+   "fieldtype": "Int",
+   "label": "Files Per Day"
+  },
+  {
+   "default": "0",
+   "depends_on": "enable_scheduled_migration",
+   "description": "Delete each local copy right after it is migrated and verified in S3, so disk frees up as files move. Enable only after verifying a sample migrated correctly (attachments, images, print formats).",
+   "fieldname": "auto_delete_after_migration",
+   "fieldtype": "Check",
+   "label": "Delete Local After Migration"
   }
  ],
  "grid_page_length": 50,
