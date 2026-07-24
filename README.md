@@ -208,22 +208,32 @@ rolls back are cleaned up automatically.
 
 ### 5. Migrating existing local files
 
-Files that were uploaded **before** installing the app stay on local disk. To move
-them into S3 and reclaim server space:
+Files that were uploaded **before** installing the app stay on local disk. Move
+them into S3 from **S3 Settings → S3 Operations**, which walks the safe order:
 
-- **UI:** *S3 Settings → Migrate Local Files* (runs in the background).
-- **Console:**
+1. **Migrate Files — Keep Local Copies** — uploads + repoints records, keeps local.
+2. **Audit Local Links** — read-only report of embedded links to review.
+3. **Delete Verified Local Copies** — reclaims disk space (strong confirmation).
+4. **Migration Status** — live counts (total / migrated / failed / missing /
+   pending); re-run step 1 to retry failed or remaining files.
 
-  ```bash
-  bench --site <site> execute aws_s3_storage.aws_s3_storage.migrate.run_migration
-  ```
+The migration runs in the background in batches and is **resumable** — each
+migrated file records its S3 key and drops out of the pending set, so it is safe to
+stop and restart. Uploads **stream from disk** (multipart), so large files do not
+have to fit in memory. Only **one** migration can run at a time (a second start is
+refused while one is active; a crashed run can be cleared with
+`reset_migration_status`). Files whose content is missing on disk are skipped for
+the rest of a run rather than retried in a loop, and a local file shared by several
+File records is kept until the last of them has been migrated.
 
-The migration works in batches and is **resumable** — each migrated file records
-its S3 key and drops out of the pending set, so it is safe to stop and restart.
-Every file is verified in S3 (size check) before its local copy is removed. Files
-whose content is missing on disk are skipped for the rest of the run rather than
-retried in a loop, and a local file shared by several File records is kept until
-the last of them has been migrated.
+The same steps are available on the console:
+
+```bash
+bench --site <site> execute aws_s3_storage.aws_s3_storage.migrate.run_migration \
+    --kwargs '{"batch_size": 100, "delete_local": 0}'
+bench --site <site> execute aws_s3_storage.aws_s3_storage.migrate.audit_local_links
+bench --site <site> execute aws_s3_storage.aws_s3_storage.migrate.cleanup_migrated_local_files
+```
 
 **What gets repointed.** Migration updates the `File` record (`file_url`/`s3_key`)
 **and** the linked document's own **Attach / Attach Image** field. Attachments
@@ -236,29 +246,19 @@ find them and review them by hand before you rely on local files being gone:
 bench --site <site> execute aws_s3_storage.aws_s3_storage.migrate.audit_local_links
 ```
 
-**Recommended production rollout.** Do the first pass **without** deleting local
-files, verify, then reclaim space:
+**Recommended production rollout** (take a server/DB snapshot first):
 
-1. Migrate and rewrite records, keeping local copies:
-
-   ```bash
-   bench --site <site> execute \
-       aws_s3_storage.aws_s3_storage.migrate.run_migration \
-       --kwargs '{"batch_size": 100, "delete_local": 0}'
-   ```
-
-2. Spot-check that new uploads, downloads and deletes work for both a **public**
-   and a **private** file, and that uploading the same file twice behaves.
-3. Run `audit_local_links` and fix any embedded links it reports.
+1. **Migrate Files — Keep Local Copies** and watch **Migration Status** to
+   completion.
+2. Spot-check that upload / download / delete work for a **public** and a
+   **private** file, and that uploading the same file twice behaves.
+3. **Audit Local Links** and fix any embedded links it reports.
 4. Compare object counts/sizes between the local `files` folders and the bucket's
    `public/` and `private/` prefixes.
-5. Reclaim disk space by deleting the verified local copies of migrated files
-   (**not** by re-running the migration — migrated files have already left the
-   pending set):
-
-   ```bash
-   bench --site <site> execute aws_s3_storage.aws_s3_storage.migrate.cleanup_migrated_local_files
-   ```
+5. Only then **Delete Verified Local Copies** to reclaim space. Do **not** re-run
+   the migration to delete — migrated files have already left the pending set, so
+   deletion is a separate step (each local copy is removed only after its S3 object
+   is verified present **with a matching size**).
 
 ---
 

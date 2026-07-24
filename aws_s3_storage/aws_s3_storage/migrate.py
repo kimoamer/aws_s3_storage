@@ -3,29 +3,43 @@
 """Migrate files that already live on local disk into S3.
 
 The app only sends *new* uploads to S3; files that existed before installation
-stay on disk. This tool moves them in resumable batches so you can actually
-reclaim server disk space.
+stay on disk. This tool moves them in resumable batches so you can reclaim server
+disk space.
 
-Recommended first run — upload and rewrite records, but keep the local copies so
-you can verify counts/sizes before anything is deleted:
+Recommended flow (also the default of the S3 Settings buttons):
 
-    bench --site <site> execute \
-        aws_s3_storage.aws_s3_storage.migrate.run_migration \
-        --kwargs '{"batch_size": 100, "delete_local": 0}'
+    1. Migrate with delete_local=0  -> uploads + rewrites records, keeps local
+    2. Verify sample public/private files, run audit_local_links, review failures
+    3. cleanup_migrated_local_files -> deletes the verified local copies
 
 Every migrated File gets its ``s3_key`` set, so the pending query naturally
-excludes it — the job is safe to stop and resume at any time. Files that can't be
-migrated (missing content) are skipped for the rest of the run instead of being
-retried in a loop.
+excludes it — the job is safe to stop and resume. Files whose content is missing
+are skipped for the rest of a run instead of looping. Uploads stream from disk
+(multipart), so a large file does not have to fit in memory.
 """
 
 import mimetypes
 import os
 
 import frappe
-from frappe.utils import cint
+from frappe.utils import cint, now_datetime
 
 from aws_s3_storage.aws_s3_storage import s3_utils
+
+STATUS_DOCTYPE = "S3 Migration Status"
+_STATUS_FIELDS = (
+	"status",
+	"total_files",
+	"processed_files",
+	"migrated_files",
+	"failed_files",
+	"missing_files",
+	"skipped_files",
+	"started_at",
+	"finished_at",
+	"last_file",
+	"error_message",
+)
 
 _PENDING_FILTERS = {
 	"is_folder": 0,
@@ -45,10 +59,80 @@ def count_pending():
 	return frappe.db.count("File", dict(_PENDING_FILTERS))
 
 
+# ---------------------------------------------------------------------------
+# Status (single doctype) + concurrency lock
+# ---------------------------------------------------------------------------
+
+
+def _set_status(**values):
+	for field, value in values.items():
+		frappe.db.set_single_value(STATUS_DOCTYPE, field, value)
+	frappe.db.commit()
+
+
+def _migration_active():
+	return frappe.db.get_single_value(STATUS_DOCTYPE, "status") in ("Queued", "Running")
+
+
 @frappe.whitelist()
-def start_migration(batch_size=100, delete_local=1):
-	"""Enqueue the migration as a background job (System Manager only)."""
+def get_migration_status():
+	"""Return the current migration status for the admin UI."""
 	frappe.only_for("System Manager")
+	doc = frappe.get_single(STATUS_DOCTYPE)
+	status = {field: doc.get(field) for field in _STATUS_FIELDS}
+	status["pending"] = count_pending()
+	return status
+
+
+@frappe.whitelist()
+def reset_migration_status():
+	"""Clear a stuck 'Running' status (e.g. after a worker crash)."""
+	frappe.only_for("System Manager")
+	_set_status(status="Idle", finished_at=now_datetime())
+	return {"ok": True}
+
+
+def _write_progress(totals, last_file):
+	_set_status(
+		processed_files=sum(totals.values()),
+		migrated_files=totals["migrated"],
+		failed_files=totals["failed"],
+		missing_files=totals["missing"],
+		skipped_files=totals["skipped"],
+		last_file=last_file,
+	)
+
+
+# ---------------------------------------------------------------------------
+# Migration
+# ---------------------------------------------------------------------------
+
+
+@frappe.whitelist()
+def start_migration(batch_size=100, delete_local=0):
+	"""Enqueue the migration as a background job (System Manager only).
+
+	Defaults to *not* deleting local files — reclaim disk space separately with
+	``cleanup_migrated_local_files`` once you have verified the migration. Refuses
+	to start if a migration is already running.
+	"""
+	frappe.only_for("System Manager")
+	if _migration_active():
+		frappe.throw("A migration is already running.")
+
+	_set_status(
+		status="Queued",
+		total_files=count_pending(),
+		processed_files=0,
+		migrated_files=0,
+		failed_files=0,
+		missing_files=0,
+		skipped_files=0,
+		started_at=now_datetime(),
+		finished_at=None,
+		last_file=None,
+		error_message=None,
+	)
 	frappe.enqueue(
 		"aws_s3_storage.aws_s3_storage.migrate.run_migration",
 		queue="long",
@@ -56,41 +140,55 @@ def start_migration(batch_size=100, delete_local=1):
 		batch_size=cint(batch_size),
 		delete_local=cint(delete_local),
 	)
-	return {"pending": count_pending()}
+	return get_migration_status()
 
 
-def run_migration(batch_size=100, delete_local=1):
+def run_migration(batch_size=100, delete_local=0):
 	"""Migrate all pending local files to S3 in batches, committing between them."""
 	batch_size = cint(batch_size) or 100
 	delete_local = cint(delete_local)
 	totals = {"migrated": 0, "skipped": 0, "missing": 0, "failed": 0}
-	# Names that were processed but did not migrate — excluded from later batches so a
-	# batch of only missing/failed files can never loop forever.
+	# Names processed but not migrated — excluded from later batches so a batch of
+	# only missing/failed files can never loop forever.
 	done_not_migrated = set()
 
-	while True:
-		names = _pending_local_files(batch_size, exclude=done_not_migrated)
-		if not names:
-			break
+	_set_status(status="Running", started_at=now_datetime(), error_message=None)
+	try:
+		processed = 0
+		while True:
+			names = _pending_local_files(batch_size, exclude=done_not_migrated)
+			if not names:
+				break
 
-		for name in names:
-			try:
-				result = migrate_file(name, delete_local=delete_local)
-			except Exception as e:
-				frappe.db.rollback()
-				result = "failed"
-				frappe.logger().error(f"S3 migration failed for File {name}: {e}")
-			totals[result] = totals.get(result, 0) + 1
-			if result != "migrated":
-				done_not_migrated.add(name)
+			for name in names:
+				try:
+					result = migrate_file(name, delete_local=delete_local)
+				except Exception as e:
+					frappe.db.rollback()
+					result = "failed"
+					frappe.logger().error(f"S3 migration failed for File {name}: {e}")
+				totals[result] = totals.get(result, 0) + 1
+				if result != "migrated":
+					done_not_migrated.add(name)
+				processed += 1
+				if processed % 25 == 0:
+					_write_progress(totals, name)
 
-		frappe.db.commit()
+			frappe.db.commit()
+			_write_progress(totals, names[-1])
+
+		_set_status(status="Completed", finished_at=now_datetime())
+	except Exception as e:
+		frappe.db.rollback()
+		_set_status(status="Failed", finished_at=now_datetime(), error_message=str(e))
+		frappe.logger().error(f"S3 migration aborted: {e}")
+		raise
 
 	frappe.logger().info(f"S3 migration finished: {totals}")
 	return totals
 
 
-def migrate_file(name, delete_local=1):
+def migrate_file(name, delete_local=0):
 	"""Migrate a single File record to S3. Returns migrated/skipped/missing."""
 	doc = frappe.get_doc("File", name)
 
@@ -98,31 +196,24 @@ def migrate_file(name, delete_local=1):
 		return "skipped"
 
 	old_main_url = doc.file_url
-
-	# Read the local content (get_content reads from disk for non-S3 files).
-	try:
-		content = doc.get_content()
-	except Exception:
-		frappe.logger().error(f"S3 migration: content missing for File {name} ({doc.file_url})")
+	local_path = _full_path(old_main_url)
+	if not local_path or not os.path.exists(local_path):
+		frappe.logger().error(f"S3 migration: content missing for File {name} ({old_main_url})")
 		return "missing"
-
-	if isinstance(content, str):
-		content = content.encode("utf-8")
 
 	settings = frappe.get_single("S3 Settings")
 	bucket = settings.bucket_name
 	s3 = s3_utils.get_s3_client()
 
+	# Stream the file straight from disk (multipart for large files) instead of
+	# loading it into memory.
+	local_size = os.path.getsize(local_path)
 	new_key = s3_utils._new_key(doc.file_name, doc.is_private)
 	content_type = mimetypes.guess_type(doc.file_name)[0] or "application/octet-stream"
-	s3.put_object(
-		Bucket=bucket,
-		Key=new_key,
-		Body=content,
-		ContentType=content_type,
-		**s3_utils._upload_extra_args(settings, content),
-	)
-	if not s3_utils.object_exists(new_key, expected_size=len(content), s3=s3, bucket=bucket):
+	s3.upload_file(local_path, bucket, new_key, ExtraArgs=_extra_args(settings, content_type))
+	# Remove the new object if the record update below rolls back.
+	s3_utils._delete_on_rollback(bucket, [new_key])
+	if not s3_utils.object_exists(new_key, expected_size=local_size, s3=s3, bucket=bucket):
 		raise RuntimeError(f"Upload verification failed for {new_key}")
 
 	update = {"file_url": s3_utils._build_file_url(new_key), "s3_key": new_key}
@@ -133,28 +224,22 @@ def migrate_file(name, delete_local=1):
 	if thumb_url and "/files/" in thumb_url and not s3_utils._extract_key(thumb_url):
 		thumb_path = _full_path(thumb_url)
 		if thumb_path and os.path.exists(thumb_path):
-			with open(thumb_path, "rb") as f:
-				thumb_bytes = f.read()
 			thumb_key = (
 				s3_utils._swap_prefix(new_key, doc.is_private).rsplit("/", 1)[0]
 				+ "/"
 				+ os.path.basename(thumb_url)
 			)
 			thumb_type = mimetypes.guess_type(thumb_url)[0] or "image/png"
-			s3.put_object(
-				Bucket=bucket,
-				Key=thumb_key,
-				Body=thumb_bytes,
-				ContentType=thumb_type,
-				**s3_utils._upload_extra_args(settings, thumb_bytes),
-			)
+			s3.upload_file(thumb_path, bucket, thumb_key, ExtraArgs=_extra_args(settings, thumb_type))
+			s3_utils._delete_on_rollback(bucket, [thumb_key])
 			update["thumbnail_url"] = s3_utils._build_file_url(thumb_key)
 			update["s3_thumbnail_key"] = thumb_key
 			old_thumb_url = thumb_url
 
 	doc.db_set(update, update_modified=False)
 	# The File record now points at S3, but the linked document's own Attach /
-	# Attach Image field still holds the old local URL — repoint it too.
+	# Attach Image field still holds the old local URL — repoint it too. A failure
+	# here aborts the file so it is retried (and stays local) instead of drifting.
 	_update_attached_field(doc, old_main_url, update["file_url"])
 	frappe.db.commit()
 
@@ -166,6 +251,14 @@ def migrate_file(name, delete_local=1):
 			_remove_local_if_unreferenced("thumbnail_url", old_thumb_url)
 
 	return "migrated"
+
+
+def _extra_args(settings, content_type):
+	# ExtraArgs for upload_file: storage class + content type (Content-MD5 is not
+	# valid for multipart uploads and is omitted).
+	extra = s3_utils._upload_extra_args(settings)
+	extra["ContentType"] = content_type
+	return extra
 
 
 def _remove_local_if_unreferenced(field, url):
@@ -182,8 +275,9 @@ def _remove_local_if_unreferenced(field, url):
 def _update_attached_field(doc, old_url, new_url):
 	"""Repoint the linked document's Attach / Attach Image field at the new URL.
 
-	Only touches the field when it still holds the exact old local URL, so it can
-	never clobber an unrelated value.
+	Only touches the field when it still holds the exact old local URL. A failure is
+	re-raised so the caller rolls the file back rather than deleting the local copy
+	while the document still points at it.
 	"""
 	if not (doc.attached_to_doctype and doc.attached_to_name and doc.attached_to_field):
 		return
@@ -197,11 +291,9 @@ def _update_attached_field(doc, old_url, new_url):
 				new_url,
 				update_modified=False,
 			)
-	except Exception as e:
-		frappe.logger().error(
-			f"S3 migration: could not update {doc.attached_to_doctype}.{doc.attached_to_field}"
-			f" for {doc.attached_to_name}: {e}"
-		)
+	except Exception:
+		frappe.logger().exception(f"S3 migration: failed to update linked field for File {doc.name}")
+		raise
 
 
 # ---------------------------------------------------------------------------
@@ -227,44 +319,59 @@ def cleanup_migrated_local_files(batch_size=200):
 
 	Use this after a ``delete_local=0`` migration. It never removes a file another
 	(not-yet-migrated) File record still points at locally, and only after
-	confirming the S3 object exists.
+	confirming the S3 object exists **with a matching size**.
 	"""
 	batch_size = cint(batch_size) or 200
 	removed = 0
 	last = ""
+	s3 = bucket = None
 	while True:
 		rows = frappe.get_all(
 			"File",
 			filters={"is_folder": 0, "s3_key": ["not in", ["", None]], "name": [">", last]},
-			fields=["name", "file_name", "is_private", "s3_key"],
+			fields=["name", "file_name", "file_size", "is_private", "s3_key", "s3_thumbnail_key"],
 			order_by="name asc",
 			limit=batch_size,
 		)
 		if not rows:
 			break
+		if s3 is None:
+			s3 = s3_utils.get_s3_client()
+			bucket = s3_utils.get_bucket()
 		for row in rows:
 			last = row.name
-			if _delete_migrated_local_copy(row):
-				removed += 1
+			removed += _delete_migrated_local_copy(row, s3, bucket)
 		frappe.db.commit()
 
 	frappe.logger().info(f"S3 local cleanup finished: removed {removed} file(s)")
 	return {"removed": removed}
 
 
-def _delete_migrated_local_copy(row):
-	if not row.file_name:
-		return False
-	local_url = ("/private/files/" if row.is_private else "/files/") + row.file_name
+def _delete_migrated_local_copy(row, s3, bucket):
+	removed = 0
+	if row.file_name:
+		main_url = ("/private/files/" if row.is_private else "/files/") + row.file_name
+		if _safe_remove_local(main_url, row.s3_key, s3, bucket, expected_size=row.file_size):
+			removed += 1
+	# Thumbnails live under public/files; the S3 thumb key's basename is the original
+	# local thumbnail filename.
+	if row.get("s3_thumbnail_key"):
+		thumb_url = "/files/" + os.path.basename(row.s3_thumbnail_key)
+		if _safe_remove_local(thumb_url, row.s3_thumbnail_key, s3, bucket, field="thumbnail_url"):
+			removed += 1
+	return removed
+
+
+def _safe_remove_local(local_url, s3_key, s3, bucket, expected_size=None, field="file_url"):
 	path = _full_path(local_url)
 	if not path or not os.path.exists(path):
 		return False
-	# A sibling still on local disk needs the file — keep it.
-	if frappe.db.exists("File", {"file_url": local_url}):
+	# A record still pointing at the local file needs it — keep it.
+	if frappe.db.exists("File", {field: local_url}):
 		return False
-	# Confirm the object is really in S3 before deleting the only local copy.
+	# Verify the object is in S3 (and, for the main file, that the size matches).
 	try:
-		if not s3_utils.object_exists(row.s3_key):
+		if not s3_utils.object_exists(s3_key, expected_size=expected_size, s3=s3, bucket=bucket):
 			return False
 	except Exception:
 		return False

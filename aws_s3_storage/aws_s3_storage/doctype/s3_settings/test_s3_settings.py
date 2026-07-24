@@ -3,6 +3,8 @@
 
 import base64
 import hashlib
+import os
+import tempfile
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 
@@ -372,6 +374,61 @@ class TestS3Settings(FrappeTestCase):
 		):
 			migrate._update_attached_field(doc, "/files/old.png", "/api/method/x?key=public/u/old.png")
 		set_value.assert_not_called()
+
+	def test_update_attached_field_raises_on_failure(self):
+		# A failed field update must propagate so the file is rolled back, not
+		# silently treated as migrated.
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		doc = frappe._dict(
+			attached_to_doctype="ToDo", attached_to_name="T1", attached_to_field="image", name="F1"
+		)
+		with (
+			patch.object(frappe.db, "get_value", return_value="/files/old.png"),
+			patch.object(frappe.db, "set_value", side_effect=RuntimeError("boom")),
+			self.assertRaises(RuntimeError),
+		):
+			migrate._update_attached_field(doc, "/files/old.png", "/api/method/x")
+
+	def test_cleanup_keeps_local_when_size_mismatches(self):
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		tmp = tempfile.NamedTemporaryFile(delete=False)
+		tmp.write(b"data")
+		tmp.close()
+		try:
+			with (
+				patch.object(migrate, "_full_path", return_value=tmp.name),
+				patch.object(frappe.db, "exists", return_value=False),
+				patch.object(s3_utils, "object_exists", return_value=False) as obj_exists,
+			):
+				removed = migrate._safe_remove_local(
+					"/files/f.png", "public/u/f.png", MagicMock(), "b", expected_size=10
+				)
+			self.assertFalse(removed)
+			self.assertTrue(os.path.exists(tmp.name))  # not deleted
+			self.assertEqual(obj_exists.call_args.kwargs.get("expected_size"), 10)
+		finally:
+			os.unlink(tmp.name)
+
+	def test_cleanup_removes_local_when_verified(self):
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		tmp = tempfile.NamedTemporaryFile(delete=False)
+		tmp.write(b"data")
+		tmp.close()
+		try:
+			with (
+				patch.object(migrate, "_full_path", return_value=tmp.name),
+				patch.object(frappe.db, "exists", return_value=False),
+				patch.object(s3_utils, "object_exists", return_value=True),
+			):
+				removed = migrate._safe_remove_local("/files/f.png", "public/u/f.png", MagicMock(), "b")
+			self.assertTrue(removed)
+			self.assertFalse(os.path.exists(tmp.name))  # deleted
+		finally:
+			if os.path.exists(tmp.name):
+				os.unlink(tmp.name)
 
 	# --- backup sync -------------------------------------------------------
 
