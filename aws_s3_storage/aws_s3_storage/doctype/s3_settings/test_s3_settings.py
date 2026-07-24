@@ -61,6 +61,17 @@ class TestS3Settings(FrappeTestCase):
 		self.assertEqual(s3_utils._swap_prefix("public/u/f.png", 1), "private/u/f.png")
 		self.assertEqual(s3_utils._swap_prefix("private/u/f.png", 0), "public/u/f.png")
 
+	def test_new_key_normal_filename(self):
+		key = s3_utils._new_key("report.pdf", 1)
+		self.assertTrue(key.startswith("private/"))
+		self.assertTrue(key.endswith("/report.pdf"))
+
+	def test_new_key_is_bounded_and_keeps_extension(self):
+		key = s3_utils._new_key("x" * 1000 + ".png", 0)
+		self.assertLessEqual(len(key), s3_utils.MAX_KEY_LENGTH)
+		self.assertTrue(key.startswith("public/"))
+		self.assertTrue(key.endswith(".png"))
+
 	# --- client / credentials ---------------------------------------------
 
 	def test_client_uses_iam_role_when_no_keys(self):

@@ -153,9 +153,26 @@ def _extract_key(file_url):
 	return _normalize_key(keys[0]) if keys else None
 
 
+# Keep keys within the s3_key column width (varchar 500); real filenames are far
+# shorter (the filesystem caps names at 255), so this only guards pathological cases.
+MAX_KEY_LENGTH = 480
+
+
+def _bounded_filename(fname, max_len):
+	if max_len <= 0:
+		return ""
+	if len(fname) <= max_len:
+		return fname
+	root, ext = os.path.splitext(fname)
+	ext = ext[:max_len]
+	keep = max_len - len(ext)
+	return (root[:keep] + ext) if keep > 0 else fname[:max_len]
+
+
 def _new_key(fname, is_private):
 	prefix = "private" if cint(is_private) else "public"
-	return f"{prefix}/{uuid.uuid4().hex}/{fname}"
+	head = f"{prefix}/{uuid.uuid4().hex}/"
+	return head + _bounded_filename(fname, MAX_KEY_LENGTH - len(head))
 
 
 def _swap_prefix(key, is_private):

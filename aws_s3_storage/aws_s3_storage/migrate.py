@@ -20,6 +20,7 @@ are skipped for the rest of a run instead of looping. Uploads stream from disk
 
 import mimetypes
 import os
+import time
 
 import frappe
 from frappe.utils import cint, now_datetime
@@ -28,6 +29,10 @@ from aws_s3_storage.aws_s3_storage import s3_utils
 
 STATUS_DOCTYPE = "S3 Migration Status"
 ERROR_DOCTYPE = "S3 Migration Error"
+# Each background job works for at most this long, then re-enqueues itself, so a run
+# of thousands of files never hits the platform's per-job timeout (~1500s).
+_TIME_BUDGET_SECONDS = 1000
+_MAX_FILES_PER_JOB = 400
 _STATUS_FIELDS = (
 	"status",
 	"total_files",
@@ -170,30 +175,55 @@ def start_migration(batch_size=100, delete_local=0):
 		last_file=None,
 		error_message=None,
 	)
-	frappe.enqueue(
-		"aws_s3_storage.aws_s3_storage.migrate.run_migration",
-		queue="long",
-		timeout=0,
-		batch_size=cint(batch_size),
-		delete_local=cint(delete_local),
-	)
+	_enqueue_run(cint(batch_size), cint(delete_local))
 	return get_migration_status()
 
 
+def _enqueue_run(batch_size, delete_local):
+	frappe.enqueue(
+		"aws_s3_storage.aws_s3_storage.migrate.run_migration",
+		queue="long",
+		timeout=_TIME_BUDGET_SECONDS + 300,
+		batch_size=batch_size,
+		delete_local=delete_local,
+	)
+
+
+def _read_totals():
+	doc = frappe.get_single(STATUS_DOCTYPE)
+	return {
+		"migrated": cint(doc.migrated_files),
+		"failed": cint(doc.failed_files),
+		"missing": cint(doc.missing_files),
+		"skipped": cint(doc.skipped_files),
+	}
+
+
 def run_migration(batch_size=100, delete_local=0):
-	"""Migrate all pending local files to S3 in batches, committing between them."""
+	"""Migrate pending local files to S3 for up to a bounded time, then re-enqueue.
+
+	The work is split across chained background jobs so a run of many thousands of
+	files never hits the platform's per-job timeout. Counts accumulate in the status
+	doctype; already-failed/missing files (recorded in the error log) are skipped so
+	the chain always makes progress and terminates.
+	"""
 	batch_size = cint(batch_size) or 100
 	delete_local = cint(delete_local)
-	totals = {"migrated": 0, "skipped": 0, "missing": 0, "failed": 0}
-	# Names processed but not migrated — excluded from later batches so a batch of
-	# only missing/failed files can never loop forever.
-	done_not_migrated = set()
 
-	_set_status(status="Running", started_at=now_datetime(), error_message=None)
-	_clear_errors()
+	# First job of the chain initialises; chained jobs continue the same run.
+	if frappe.db.get_single_value(STATUS_DOCTYPE, "status") != "Running":
+		_set_status(status="Running", started_at=now_datetime(), error_message=None)
+		_clear_errors()
+
+	totals = _read_totals()
+	# Persisted across chained jobs via the error log, so failed/missing files are
+	# not retried forever.
+	done_not_migrated = set(frappe.get_all(ERROR_DOCTYPE, pluck="file"))
+
+	started = time.monotonic()
+	processed_this_job = 0
 	try:
-		processed = 0
-		while True:
+		while processed_this_job < _MAX_FILES_PER_JOB and (time.monotonic() - started) < _TIME_BUDGET_SECONDS:
 			names = _pending_local_files(batch_size, exclude=done_not_migrated)
 			if not names:
 				break
@@ -214,21 +244,28 @@ def run_migration(batch_size=100, delete_local=0):
 					done_not_migrated.add(name)
 					if result in ("failed", "missing"):
 						_record_error(name, result.capitalize(), err)
-				processed += 1
-				if processed % 25 == 0:
-					_write_progress(totals, name)
+				processed_this_job += 1
+				if (
+					processed_this_job >= _MAX_FILES_PER_JOB
+					or (time.monotonic() - started) >= _TIME_BUDGET_SECONDS
+				):
+					break
 
 			frappe.db.commit()
 			_write_progress(totals, names[-1])
-
-		_set_status(status="Completed", finished_at=now_datetime())
 	except Exception as e:
 		frappe.db.rollback()
 		_set_status(status="Failed", finished_at=now_datetime(), error_message=str(e))
 		frappe.logger().error(f"S3 migration aborted: {e}")
 		raise
 
-	frappe.logger().info(f"S3 migration finished: {totals}")
+	# Continue in a fresh job if anything is still pending; otherwise finish.
+	if _pending_local_files(1, exclude=done_not_migrated):
+		_enqueue_run(batch_size, delete_local)
+	else:
+		_set_status(status="Completed", finished_at=now_datetime())
+
+	frappe.logger().info(f"S3 migration job done: {totals} (+{processed_this_job} this job)")
 	return totals
 
 
