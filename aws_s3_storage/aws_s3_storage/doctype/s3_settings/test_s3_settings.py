@@ -248,6 +248,14 @@ class TestS3Settings(FrappeTestCase):
 		self.assertEqual(f.get_full_path(), url)
 		self.assertTrue(f.validate_file_on_disk())
 
+	def test_is_remote_file_true_for_s3_url(self):
+		# On older Frappe (URL_PREFIXES without /api/method), the app must classify
+		# its own download URL as remote so validate_file_path/url short-circuit.
+		from aws_s3_storage.aws_s3_storage.file_override import S3File
+
+		f = S3File({"doctype": "File", "file_url": s3_utils._build_file_url("public/uid/f.png")})
+		self.assertTrue(f.is_remote_file)
+
 	@patch.object(s3_utils, "get_s3_client")
 	def test_delete_skips_key_still_referenced(self, mock_get_client):
 		s3 = MagicMock()
