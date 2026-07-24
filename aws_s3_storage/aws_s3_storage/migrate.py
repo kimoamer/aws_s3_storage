@@ -201,14 +201,14 @@ def _read_totals():
 	}
 
 
-def run_migration(batch_size=100, delete_local=0, time_budget=0):
+def run_migration(batch_size=100, delete_local=0, time_budget=0, max_files=0, reset=1):
 	"""Migrate pending local files to S3.
 
-	``time_budget=0`` (the default — e.g. a direct ``bench execute`` call) runs to
-	completion in this process and only ever leaves the status "Completed" or
-	"Failed". A positive budget (used by the S3 Settings button) works for that many
-	seconds, then re-enqueues itself, so a run of thousands of files on a managed
-	platform never hits the worker's per-job timeout.
+	* ``time_budget=0`` (default, e.g. ``bench execute``) runs to completion.
+	* ``time_budget>0`` (the S3 Settings button) works that long, then re-enqueues.
+	* ``max_files>0`` stops after that many files (the daily scheduled migration).
+	* ``reset=0`` keeps the running counters (so the daily run shows cumulative
+	  progress across days) and pauses on "Idle" instead of resetting.
 
 	Counts accumulate in the status doctype; failed/missing files (recorded in the
 	error log) are skipped so the run always makes progress and terminates.
@@ -216,9 +216,11 @@ def run_migration(batch_size=100, delete_local=0, time_budget=0):
 	batch_size = cint(batch_size) or 100
 	delete_local = cint(delete_local)
 	time_budget = cint(time_budget)
+	max_files = cint(max_files)
+	reset = cint(reset)
 
 	status = frappe.db.get_single_value(STATUS_DOCTYPE, "status")
-	if status not in ("Running", "Queued"):
+	if reset and status not in ("Running", "Queued"):
 		# Fresh standalone run (console, or first invocation): reset counters.
 		_set_status(
 			status="Running",
@@ -236,22 +238,34 @@ def run_migration(batch_size=100, delete_local=0, time_budget=0):
 		_clear_errors()
 	elif status == "Queued":
 		_set_status(status="Running", started_at=now_datetime())
+	else:
+		# Resume (chained job, or the daily incremental run): keep the counters.
+		_set_status(status="Running", started_at=now_datetime(), error_message=None)
+		if not cint(frappe.db.get_single_value(STATUS_DOCTYPE, "total_files")):
+			_set_status(total_files=count_pending())
 
 	totals = _read_totals()
-	# Persisted across chained jobs via the error log, so failed/missing files are
-	# not retried forever.
+	# Persisted across jobs via the error log, so failed/missing files are not
+	# retried forever.
 	done_not_migrated = set(frappe.get_all(ERROR_DOCTYPE, pluck="file"))
 
 	started = time.monotonic()
 	processed_this_job = 0
 
-	def _budget_reached():
-		return bool(time_budget) and (
+	# Reuse one S3 client + settings for the whole job instead of rebuilding them
+	# per file — matters a lot at tens of thousands of files.
+	settings = frappe.get_single("S3 Settings")
+	s3 = s3_utils.get_s3_client()
+
+	def _stop():
+		if time_budget and (
 			processed_this_job >= _MAX_FILES_PER_JOB or (time.monotonic() - started) >= time_budget
-		)
+		):
+			return True
+		return bool(max_files) and processed_this_job >= max_files
 
 	try:
-		while not _budget_reached():
+		while not _stop():
 			names = _pending_local_files(batch_size, exclude=done_not_migrated)
 			if not names:
 				break
@@ -259,7 +273,7 @@ def run_migration(batch_size=100, delete_local=0, time_budget=0):
 			for name in names:
 				err = None
 				try:
-					result = migrate_file(name, delete_local=delete_local)
+					result = migrate_file(name, delete_local=delete_local, s3=s3, settings=settings)
 				except Exception as e:
 					frappe.db.rollback()
 					result = "failed"
@@ -273,7 +287,7 @@ def run_migration(batch_size=100, delete_local=0, time_budget=0):
 					if result in ("failed", "missing"):
 						_record_error(name, result.capitalize(), err)
 				processed_this_job += 1
-				if _budget_reached():
+				if _stop():
 					break
 
 			frappe.db.commit()
@@ -284,10 +298,13 @@ def run_migration(batch_size=100, delete_local=0, time_budget=0):
 		frappe.logger().error(f"S3 migration aborted: {e}")
 		raise
 
-	# In budgeted (button) mode, hand off to a fresh job if work remains. A
-	# run-to-completion call has already drained everything it can.
-	if time_budget and _pending_local_files(1, exclude=done_not_migrated):
+	still_pending = bool(_pending_local_files(1, exclude=done_not_migrated))
+	if time_budget and still_pending:
+		# Chained mode: continue in a fresh job.
 		_enqueue_run(batch_size, delete_local, time_budget)
+	elif max_files and still_pending:
+		# Daily quota reached but files remain: pause until the next scheduled run.
+		_set_status(status="Idle", finished_at=now_datetime())
 	else:
 		_set_status(status="Completed", finished_at=now_datetime())
 
@@ -295,8 +312,32 @@ def run_migration(batch_size=100, delete_local=0, time_budget=0):
 	return totals
 
 
-def migrate_file(name, delete_local=0):
-	"""Migrate a single File record to S3. Returns migrated/skipped/missing."""
+def scheduled_migration():
+	"""Daily scheduler: migrate up to `daily_migration_limit` local files.
+
+	Optionally deletes each local copy right after it is migrated and verified
+	(``auto_delete_after_migration``), so disk frees up incrementally. Skips if a
+	migration is already running or S3 storage isn't configured.
+	"""
+	settings = frappe.get_single("S3 Settings")
+	if not cint(settings.get("enable_scheduled_migration")):
+		return
+	if not cint(settings.get("enabled")) or not settings.bucket_name:
+		return
+	if _migration_active():
+		return
+
+	limit = cint(settings.get("daily_migration_limit")) or 1000
+	delete_local = cint(settings.get("auto_delete_after_migration"))
+	run_migration(batch_size=100, delete_local=delete_local, max_files=limit, reset=0)
+
+
+def migrate_file(name, delete_local=0, s3=None, settings=None):
+	"""Migrate a single File record to S3. Returns migrated/skipped/missing.
+
+	``s3``/``settings`` may be passed in so a batch reuses one client instead of
+	building a new boto3 client (and re-reading settings) per file.
+	"""
 	doc = frappe.get_doc("File", name)
 
 	if doc.is_folder or doc.get("s3_key") or s3_utils._extract_key(doc.file_url):
@@ -308,9 +349,9 @@ def migrate_file(name, delete_local=0):
 		frappe.logger().error(f"S3 migration: content missing for File {name} ({old_main_url})")
 		return "missing"
 
-	settings = frappe.get_single("S3 Settings")
+	settings = settings or frappe.get_single("S3 Settings")
 	bucket = settings.bucket_name
-	s3 = s3_utils.get_s3_client()
+	s3 = s3 or s3_utils.get_s3_client()
 
 	# Stream the file straight from disk (multipart for large files) instead of
 	# loading it into memory.

@@ -148,7 +148,10 @@ override_doctype_class = {"File": "aws_s3_storage.aws_s3_storage.file_override.S
 # ---------------
 
 scheduler_events = {
-	"daily": ["aws_s3_storage.aws_s3_storage.s3_utils.sync_backups_to_s3"],
+	"daily": [
+		"aws_s3_storage.aws_s3_storage.s3_utils.sync_backups_to_s3",
+		"aws_s3_storage.aws_s3_storage.migrate.scheduled_migration",
+	],
 	"hourly": ["aws_s3_storage.aws_s3_storage.s3_utils.process_deletion_queue"],
 }
 
