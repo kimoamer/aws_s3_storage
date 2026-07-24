@@ -6,6 +6,7 @@
  "editable_grid": 1,
  "engine": "InnoDB",
  "field_order": [
+  "enabled",
   "bucket_name",
   "region",
   "access_key_id",
@@ -21,6 +22,13 @@
   "delete_local_backup_after_sync"
  ],
  "fields": [
+  {
+   "default": "1",
+   "description": "When on, new uploads are stored in S3. When off (or before a bucket is configured), files fall back to Frappe's local storage. Existing S3 files keep working either way.",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enable S3 Storage"
+  },
   {
    "fieldname": "bucket_name",
    "fieldtype": "Data",

@@ -27,6 +27,7 @@ from frappe.utils import cint, now_datetime
 from aws_s3_storage.aws_s3_storage import s3_utils
 
 STATUS_DOCTYPE = "S3 Migration Status"
+ERROR_DOCTYPE = "S3 Migration Error"
 _STATUS_FIELDS = (
 	"status",
 	"total_files",
@@ -76,12 +77,48 @@ def _migration_active():
 
 @frappe.whitelist()
 def get_migration_status():
-	"""Return the current migration status for the admin UI."""
+	"""Return the current migration status (and recent errors) for the admin UI."""
 	frappe.only_for("System Manager")
 	doc = frappe.get_single(STATUS_DOCTYPE)
 	status = {field: doc.get(field) for field in _STATUS_FIELDS}
 	status["pending"] = count_pending()
+	status["errors"] = get_migration_errors(limit=20)
 	return status
+
+
+@frappe.whitelist()
+def get_migration_errors(limit=100):
+	"""List files that failed to migrate, with the reason."""
+	frappe.only_for("System Manager")
+	return frappe.get_all(
+		ERROR_DOCTYPE,
+		fields=["file", "reason", "file_url", "error", "creation"],
+		order_by="creation desc",
+		limit=cint(limit) or 100,
+	)
+
+
+def _clear_errors():
+	frappe.db.delete(ERROR_DOCTYPE)
+	frappe.db.commit()
+
+
+def _record_error(name, reason, error):
+	"""Persist why a file did not migrate so the admin can see it in the UI."""
+	try:
+		file_url = frappe.db.get_value("File", name, "file_url")
+		frappe.get_doc(
+			{
+				"doctype": ERROR_DOCTYPE,
+				"file": name,
+				"file_url": file_url,
+				"reason": reason,
+				"error": (error or "")[:2000],
+			}
+		).insert(ignore_permissions=True)
+		frappe.db.commit()
+	except Exception:
+		frappe.logger().error(f"S3 migration: could not record error for File {name}")
 
 
 @frappe.whitelist()
@@ -153,6 +190,7 @@ def run_migration(batch_size=100, delete_local=0):
 	done_not_migrated = set()
 
 	_set_status(status="Running", started_at=now_datetime(), error_message=None)
+	_clear_errors()
 	try:
 		processed = 0
 		while True:
@@ -161,15 +199,21 @@ def run_migration(batch_size=100, delete_local=0):
 				break
 
 			for name in names:
+				err = None
 				try:
 					result = migrate_file(name, delete_local=delete_local)
 				except Exception as e:
 					frappe.db.rollback()
 					result = "failed"
+					err = str(e)
 					frappe.logger().error(f"S3 migration failed for File {name}: {e}")
+				if result == "missing":
+					err = "Local file not found on disk"
 				totals[result] = totals.get(result, 0) + 1
 				if result != "migrated":
 					done_not_migrated.add(name)
+					if result in ("failed", "missing"):
+						_record_error(name, result.capitalize(), err)
 				processed += 1
 				if processed % 25 == 0:
 					_write_progress(totals, name)

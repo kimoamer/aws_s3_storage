@@ -125,6 +125,7 @@ Open **S3 Settings** (a single doctype, System Manager only) and fill it in.
 
 | Field | Required | Description |
 | --- | --- | --- |
+| **Enable S3 Storage** | — | Master switch (on by default). When on, new uploads go to S3. When off — or before a bucket is configured — uploads fall back to Frappe's local storage instead of failing. Existing S3 files keep being served and deleted correctly either way. |
 | **Bucket Name** | Yes | The exact S3 bucket name. |
 | **Region** | Yes | The bucket's region code, e.g. `eu-central-1`. Must match the bucket's actual region — presigned URLs (SigV4) fail if it doesn't. |
 | **Access Key ID** | No | The IAM user's access key ID. **Leave blank on AWS to use the server's EC2 IAM role / instance profile** (recommended — no secret stored in the database). |
@@ -215,7 +216,13 @@ them into S3 from **S3 Settings → S3 Operations**, which walks the safe order:
 2. **Audit Local Links** — read-only report of embedded links to review.
 3. **Delete Verified Local Copies** — reclaims disk space (strong confirmation).
 4. **Migration Status** — live counts (total / migrated / failed / missing /
-   pending); re-run step 1 to retry failed or remaining files.
+   pending) **and the reason each file failed**; re-run step 1 to retry failed or
+   remaining files.
+
+Every file that fails or is missing is recorded in the **S3 Migration Error**
+doctype (file, reason, error) — the Migration Status dialog shows the most recent,
+and the full list is in that doctype's list view. The list is cleared at the start
+of each run.
 
 The migration runs in the background in batches and is **resumable** — each
 migrated file records its S3 key and drops out of the pending set, so it is safe to
