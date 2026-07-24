@@ -386,6 +386,7 @@ class TestS3Settings(FrappeTestCase):
 		doc = frappe._dict(attached_to_doctype="ToDo", attached_to_name="T1", attached_to_field="image")
 		saved = {}
 		with (
+			patch.object(migrate, "_is_stored_field", return_value=True),
 			patch.object(frappe.db, "get_value", return_value="/files/old.png"),
 			patch.object(frappe.db, "set_value", side_effect=lambda dt, dn, f, v, **k: saved.update(v=v)),
 		):
@@ -397,10 +398,26 @@ class TestS3Settings(FrappeTestCase):
 
 		doc = frappe._dict(attached_to_doctype="ToDo", attached_to_name="T1", attached_to_field="image")
 		with (
+			patch.object(migrate, "_is_stored_field", return_value=True),
 			patch.object(frappe.db, "get_value", return_value="/files/something-else.png"),
 			patch.object(frappe.db, "set_value") as set_value,
 		):
 			migrate._update_attached_field(doc, "/files/old.png", "/api/method/x?key=public/u/old.png")
+		set_value.assert_not_called()
+
+	def test_update_attached_field_skips_when_field_not_a_column(self):
+		# The real-world "Unknown column 'file'" case: linked field is not a stored
+		# column — skip quietly instead of failing the whole file.
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		doc = frappe._dict(attached_to_doctype="ToDo", attached_to_name="T1", attached_to_field="file")
+		with (
+			patch.object(migrate, "_is_stored_field", return_value=False),
+			patch.object(frappe.db, "get_value") as get_value,
+			patch.object(frappe.db, "set_value") as set_value,
+		):
+			migrate._update_attached_field(doc, "/files/old.png", "/api/method/x")
+		get_value.assert_not_called()
 		set_value.assert_not_called()
 
 	def test_record_error_inserts_row(self):
@@ -435,6 +452,7 @@ class TestS3Settings(FrappeTestCase):
 			attached_to_doctype="ToDo", attached_to_name="T1", attached_to_field="image", name="F1"
 		)
 		with (
+			patch.object(migrate, "_is_stored_field", return_value=True),
 			patch.object(frappe.db, "get_value", return_value="/files/old.png"),
 			patch.object(frappe.db, "set_value", side_effect=RuntimeError("boom")),
 			self.assertRaises(RuntimeError),
