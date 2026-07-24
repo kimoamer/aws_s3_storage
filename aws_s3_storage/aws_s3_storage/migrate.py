@@ -245,6 +245,11 @@ def run_migration(batch_size=100, delete_local=0, time_budget=0):
 	started = time.monotonic()
 	processed_this_job = 0
 
+	# Reuse one S3 client + settings for the whole job instead of rebuilding them
+	# per file — matters a lot at tens of thousands of files.
+	settings = frappe.get_single("S3 Settings")
+	s3 = s3_utils.get_s3_client()
+
 	def _budget_reached():
 		return bool(time_budget) and (
 			processed_this_job >= _MAX_FILES_PER_JOB or (time.monotonic() - started) >= time_budget
@@ -259,7 +264,7 @@ def run_migration(batch_size=100, delete_local=0, time_budget=0):
 			for name in names:
 				err = None
 				try:
-					result = migrate_file(name, delete_local=delete_local)
+					result = migrate_file(name, delete_local=delete_local, s3=s3, settings=settings)
 				except Exception as e:
 					frappe.db.rollback()
 					result = "failed"
@@ -295,8 +300,12 @@ def run_migration(batch_size=100, delete_local=0, time_budget=0):
 	return totals
 
 
-def migrate_file(name, delete_local=0):
-	"""Migrate a single File record to S3. Returns migrated/skipped/missing."""
+def migrate_file(name, delete_local=0, s3=None, settings=None):
+	"""Migrate a single File record to S3. Returns migrated/skipped/missing.
+
+	``s3``/``settings`` may be passed in so a batch reuses one client instead of
+	building a new boto3 client (and re-reading settings) per file.
+	"""
 	doc = frappe.get_doc("File", name)
 
 	if doc.is_folder or doc.get("s3_key") or s3_utils._extract_key(doc.file_url):
@@ -308,9 +317,9 @@ def migrate_file(name, delete_local=0):
 		frappe.logger().error(f"S3 migration: content missing for File {name} ({old_main_url})")
 		return "missing"
 
-	settings = frappe.get_single("S3 Settings")
+	settings = settings or frappe.get_single("S3 Settings")
 	bucket = settings.bucket_name
-	s3 = s3_utils.get_s3_client()
+	s3 = s3 or s3_utils.get_s3_client()
 
 	# Stream the file straight from disk (multipart for large files) instead of
 	# loading it into memory.
