@@ -175,17 +175,19 @@ def start_migration(batch_size=100, delete_local=0):
 		last_file=None,
 		error_message=None,
 	)
-	_enqueue_run(cint(batch_size), cint(delete_local))
+	_clear_errors()
+	_enqueue_run(cint(batch_size), cint(delete_local), _TIME_BUDGET_SECONDS)
 	return get_migration_status()
 
 
-def _enqueue_run(batch_size, delete_local):
+def _enqueue_run(batch_size, delete_local, time_budget):
 	frappe.enqueue(
 		"aws_s3_storage.aws_s3_storage.migrate.run_migration",
 		queue="long",
-		timeout=_TIME_BUDGET_SECONDS + 300,
+		timeout=(time_budget + 300) if time_budget else 0,
 		batch_size=batch_size,
 		delete_local=delete_local,
+		time_budget=time_budget,
 	)
 
 
@@ -199,21 +201,41 @@ def _read_totals():
 	}
 
 
-def run_migration(batch_size=100, delete_local=0):
-	"""Migrate pending local files to S3 for up to a bounded time, then re-enqueue.
+def run_migration(batch_size=100, delete_local=0, time_budget=0):
+	"""Migrate pending local files to S3.
 
-	The work is split across chained background jobs so a run of many thousands of
-	files never hits the platform's per-job timeout. Counts accumulate in the status
-	doctype; already-failed/missing files (recorded in the error log) are skipped so
-	the chain always makes progress and terminates.
+	``time_budget=0`` (the default — e.g. a direct ``bench execute`` call) runs to
+	completion in this process and only ever leaves the status "Completed" or
+	"Failed". A positive budget (used by the S3 Settings button) works for that many
+	seconds, then re-enqueues itself, so a run of thousands of files on a managed
+	platform never hits the worker's per-job timeout.
+
+	Counts accumulate in the status doctype; failed/missing files (recorded in the
+	error log) are skipped so the run always makes progress and terminates.
 	"""
 	batch_size = cint(batch_size) or 100
 	delete_local = cint(delete_local)
+	time_budget = cint(time_budget)
 
-	# First job of the chain initialises; chained jobs continue the same run.
-	if frappe.db.get_single_value(STATUS_DOCTYPE, "status") != "Running":
-		_set_status(status="Running", started_at=now_datetime(), error_message=None)
+	status = frappe.db.get_single_value(STATUS_DOCTYPE, "status")
+	if status not in ("Running", "Queued"):
+		# Fresh standalone run (console, or first invocation): reset counters.
+		_set_status(
+			status="Running",
+			started_at=now_datetime(),
+			finished_at=None,
+			error_message=None,
+			total_files=count_pending(),
+			processed_files=0,
+			migrated_files=0,
+			failed_files=0,
+			missing_files=0,
+			skipped_files=0,
+			last_file=None,
+		)
 		_clear_errors()
+	elif status == "Queued":
+		_set_status(status="Running", started_at=now_datetime())
 
 	totals = _read_totals()
 	# Persisted across chained jobs via the error log, so failed/missing files are
@@ -222,8 +244,14 @@ def run_migration(batch_size=100, delete_local=0):
 
 	started = time.monotonic()
 	processed_this_job = 0
+
+	def _budget_reached():
+		return bool(time_budget) and (
+			processed_this_job >= _MAX_FILES_PER_JOB or (time.monotonic() - started) >= time_budget
+		)
+
 	try:
-		while processed_this_job < _MAX_FILES_PER_JOB and (time.monotonic() - started) < _TIME_BUDGET_SECONDS:
+		while not _budget_reached():
 			names = _pending_local_files(batch_size, exclude=done_not_migrated)
 			if not names:
 				break
@@ -245,10 +273,7 @@ def run_migration(batch_size=100, delete_local=0):
 					if result in ("failed", "missing"):
 						_record_error(name, result.capitalize(), err)
 				processed_this_job += 1
-				if (
-					processed_this_job >= _MAX_FILES_PER_JOB
-					or (time.monotonic() - started) >= _TIME_BUDGET_SECONDS
-				):
+				if _budget_reached():
 					break
 
 			frappe.db.commit()
@@ -259,9 +284,10 @@ def run_migration(batch_size=100, delete_local=0):
 		frappe.logger().error(f"S3 migration aborted: {e}")
 		raise
 
-	# Continue in a fresh job if anything is still pending; otherwise finish.
-	if _pending_local_files(1, exclude=done_not_migrated):
-		_enqueue_run(batch_size, delete_local)
+	# In budgeted (button) mode, hand off to a fresh job if work remains. A
+	# run-to-completion call has already drained everything it can.
+	if time_budget and _pending_local_files(1, exclude=done_not_migrated):
+		_enqueue_run(batch_size, delete_local, time_budget)
 	else:
 		_set_status(status="Completed", finished_at=now_datetime())
 

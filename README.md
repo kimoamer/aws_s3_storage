@@ -224,12 +224,17 @@ doctype (file, reason, error) — the Migration Status dialog shows the most rec
 and the full list is in that doctype's list view. The list is cleared at the start
 of each run.
 
-The migration runs in the background in batches and is **resumable** — each
-migrated file records its S3 key and drops out of the pending set, so it is safe to
-stop and restart. It also **survives per-job time limits**: each job works for a
-bounded time (~1000s) and then re-enqueues itself, so migrating thousands of files
-on a managed platform (e.g. Frappe Cloud) won't hit the worker timeout. Uploads
-**stream from disk** (multipart), so large files do not have to fit in memory. Only **one** migration can run at a time (a second start is
+The migration runs in batches and is **resumable** — each migrated file records
+its S3 key and drops out of the pending set, so it is safe to stop and restart.
+Uploads **stream from disk** (multipart), so large files do not have to fit in
+memory. There are two ways to run it, with different completion behaviour:
+
+- **S3 Settings button** → a chained background job: each job works for a bounded
+  time (~1000s) then re-enqueues itself, so migrating thousands of files on a
+  managed platform (e.g. Frappe Cloud) never hits the worker's per-job timeout.
+- **`bench execute … run_migration`** → runs to completion in that one process and
+  finishes (status `Completed`); it does not detach or leave the status stuck on
+  `Running`. Use this from the console for large one-shot migrations. Only **one** migration can run at a time (a second start is
 refused while one is active; a crashed run can be cleared with
 `reset_migration_status`). Files whose content is missing on disk are skipped for
 the rest of a run rather than retried in a loop, and a local file shared by several
