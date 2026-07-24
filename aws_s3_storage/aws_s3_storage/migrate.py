@@ -316,14 +316,34 @@ def _remove_local_if_unreferenced(field, url):
 		frappe.logger().error(f"S3 migration: could not remove local file {path}: {e}")
 
 
+def _is_stored_field(doctype, fieldname):
+	"""True only if ``fieldname`` is a real, stored DB column on ``doctype``.
+
+	Guards against attachments linked to a field that is not a queryable column
+	(a deleted field, a layout/no-value field, a virtual field, or a field that
+	lives in a child table rather than the parent) — querying those raises
+	"Unknown column".
+	"""
+	from frappe.model import no_value_fields
+
+	try:
+		df = frappe.get_meta(doctype).get_field(fieldname)
+	except Exception:
+		return False
+	return bool(df) and df.fieldtype not in no_value_fields and not df.get("is_virtual")
+
+
 def _update_attached_field(doc, old_url, new_url):
 	"""Repoint the linked document's Attach / Attach Image field at the new URL.
 
-	Only touches the field when it still holds the exact old local URL. A failure is
-	re-raised so the caller rolls the file back rather than deleting the local copy
-	while the document still points at it.
+	Only touches the field when it is a real column that still holds the exact old
+	local URL. A genuine update failure is re-raised so the caller rolls the file
+	back rather than deleting the local copy while the document still points at it.
 	"""
 	if not (doc.attached_to_doctype and doc.attached_to_name and doc.attached_to_field):
+		return
+	# Nothing to repoint if the link doesn't map to a stored column — skip quietly.
+	if not _is_stored_field(doc.attached_to_doctype, doc.attached_to_field):
 		return
 	try:
 		current = frappe.db.get_value(doc.attached_to_doctype, doc.attached_to_name, doc.attached_to_field)
