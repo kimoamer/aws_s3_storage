@@ -17,6 +17,17 @@ class S3File(File):
 	deduplication. Each of those is routed through boto3 instead.
 	"""
 
+	@property
+	def is_remote_file(self):
+		# Older Frappe (e.g. v15.69) only treats http(s) URLs as remote, so our
+		# relative "/api/method/...download_file" URL would be validated as a local
+		# path and rejected ("The File URL you've entered is incorrect"). Recognising
+		# it here makes validate_file_path / validate_file_url short-circuit on every
+		# Frappe 15 build, old or new.
+		if self.file_url and s3_utils._extract_key(self.file_url):
+			return True
+		return super().is_remote_file
+
 	def before_insert(self):
 		super().before_insert()
 		# Deduplication: when Frappe reuses an existing S3 object for a duplicate
