@@ -153,6 +153,16 @@ def _extract_key(file_url):
 	return _normalize_key(keys[0]) if keys else None
 
 
+def _content_disposition(filename):
+	# HTTP header values must be latin-1, so a non-ASCII filename (e.g. Arabic) is
+	# sent RFC 5987 style (filename*), with a plain ASCII fallback for old clients.
+	# Without this S3 rejects the presigned URL with "Header value cannot be
+	# represented using ISO-8859-1".
+	ascii_name = filename.encode("ascii", "ignore").decode().replace('"', "").replace("\\", "").strip()
+	ascii_name = ascii_name or "file"
+	return f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename, safe='')}"
+
+
 # Keep keys within the s3_key column width (varchar 500); real filenames are far
 # shorter (the filesystem caps names at 255), so this only guards pathological cases.
 MAX_KEY_LENGTH = 480
@@ -381,7 +391,7 @@ def download_file(key):
 		Params={
 			"Bucket": settings.bucket_name,
 			"Key": key,
-			"ResponseContentDisposition": f'inline; filename="{key.rsplit("/", 1)[-1]}"',
+			"ResponseContentDisposition": _content_disposition(key.rsplit("/", 1)[-1]),
 		},
 		ExpiresIn=_presigned_expiry(settings),
 	)
