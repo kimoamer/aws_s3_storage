@@ -41,6 +41,13 @@ class TestS3Settings(FrappeTestCase):
 		self.assertIn("key=public/uid/fb.png", url)
 		self.assertNotIn("%2F", url)
 
+	def test_content_disposition_is_latin1_safe_for_arabic(self):
+		cd = s3_utils._content_disposition("03- السجل تجاري.pdf")
+		# Must be representable as a latin-1 HTTP header (no raw non-ASCII bytes).
+		cd.encode("latin-1")
+		self.assertIn("filename*=UTF-8''", cd)
+		self.assertNotIn("السجل", cd)  # the non-ASCII part is percent-encoded
+
 	def test_normalize_key_strips_double_encoding(self):
 		self.assertEqual(s3_utils._normalize_key("public/uid/fb.png"), "public/uid/fb.png")
 		self.assertEqual(s3_utils._normalize_key("public%2Fuid%2Ffb.png"), "public/uid/fb.png")
