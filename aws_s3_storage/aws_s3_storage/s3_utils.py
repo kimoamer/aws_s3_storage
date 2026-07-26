@@ -379,14 +379,23 @@ def move_object_privacy(file_doc):
 
 
 @frappe.whitelist(allow_guest=True)
-def download_file(key):
-	"""Redirect to a short-lived presigned URL for an S3-stored file.
+def download_file(key=None):
+	"""Serve an S3 file while preserving literal '+' characters in its key."""
 
-	Only ``public/`` and ``private/`` objects are ever served — never backups or
-	any other prefix. Public files are served to anyone; private files require read
-	permission on the owning File document.
-	"""
-	key = _normalize_key(key)
+	raw_query = ""
+
+	if frappe.request:
+		raw_query = frappe.request.query_string or b""
+
+		if isinstance(raw_query, bytes):
+			raw_query = raw_query.decode("utf-8", errors="replace")
+
+	# Read directly from the raw query string.
+	# This prevents Werkzeug/Frappe from treating '+' as a space.
+	raw_key = _extract_key(f"/?{raw_query}") if raw_query else None
+
+	key = raw_key or _normalize_key(key)
+
 	if not key or not key.startswith(SERVABLE_PREFIXES):
 		raise frappe.PermissionError
 
