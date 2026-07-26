@@ -45,6 +45,16 @@ class S3File(File):
 			if thumb_key:
 				self.s3_thumbnail_key = thumb_key
 
+	def check_content(self):
+		# Frappe's check_content() reads self._content directly, but _content is only
+		# set by get_content(). On builds that call check_content() from validate(),
+		# copying an existing S3-backed attachment (e.g. amending a document) never
+		# loads it, raising AttributeError. Default it so the scan is simply skipped
+		# for content we don't have in hand — it was already scanned on upload.
+		if not hasattr(self, "_content"):
+			self._content = None
+		return super().check_content()
+
 	def get_full_path(self):
 		# Frappe's get_full_path() runs the "/api/method/..." URL through is_safe_path()
 		# and rejects it ("Cannot access file path") while saving the record. For an

@@ -266,6 +266,22 @@ class TestS3Settings(FrappeTestCase):
 		self.assertEqual(f.get_full_path(), url)
 		self.assertTrue(f.validate_file_on_disk())
 
+	def test_check_content_without_loaded_content(self):
+		# Amending a doc copies an S3-backed attachment whose content was never
+		# loaded; check_content must not raise AttributeError on _content.
+		from aws_s3_storage.aws_s3_storage.file_override import S3File
+
+		f = S3File(
+			{
+				"doctype": "File",
+				"file_name": "doc.pdf",
+				"file_type": "PDF",
+				"file_url": s3_utils._build_file_url("private/uid/doc.pdf"),
+			}
+		)
+		self.assertFalse(hasattr(f, "_content"))
+		f.check_content()  # must not raise
+
 	def test_is_remote_file_true_for_s3_url(self):
 		# On older Frappe (URL_PREFIXES without /api/method), the app must classify
 		# its own download URL as remote so validate_file_path/url short-circuit.
