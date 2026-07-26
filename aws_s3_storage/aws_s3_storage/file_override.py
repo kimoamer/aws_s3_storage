@@ -16,7 +16,26 @@ class S3File(File):
 	moving remote files when privacy changes, and can't detect S3 objects for
 	deduplication. Each of those is routed through boto3 instead.
 	"""
+	def __init__(self, *args, **kwargs):
+		super().__init__(*args, **kwargs)
 
+		# Frappe's File.check_content() accesses _content directly.
+		# Attachment copies created during Amend may reference an existing
+		# S3 object without loading its content first.
+		self._content = getattr(self, "_content", None)
+
+	def check_content(self):
+		"""Load S3-backed PDF content before Frappe performs its security check."""
+
+		if self.file_type == "PDF" and not self._content:
+			if self.get("content"):
+				self._content = self.get_content()
+			else:
+				key = s3_utils._extract_key(self.file_url)
+				if key:
+					self._content = s3_utils.read_file_from_s3(key)
+
+		return super().check_content()
 	@property
 	def is_remote_file(self):
 		# Older Frappe (e.g. v15.69) only treats http(s) URLs as remote, so our
