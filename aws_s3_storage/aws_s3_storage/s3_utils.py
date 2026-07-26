@@ -3,7 +3,7 @@ import hashlib
 import mimetypes
 import os
 import uuid
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import boto3
 import frappe
@@ -146,11 +146,28 @@ def _normalize_key(key):
 
 
 def _extract_key(file_url):
-	# Recover the S3 object key that was embedded in the file URL by _build_file_url.
+	"""Extract the S3 key without converting literal '+' characters to spaces.
+
+	urllib.parse.parse_qs() uses form-encoding rules where '+' means a space.
+	S3 object keys may legitimately contain '+', especially in filenames such
+	as '(2+1).pdf', so parse the raw query manually and decode with unquote().
+	"""
 	if not file_url:
 		return None
-	keys = parse_qs(urlparse(file_url).query).get("key")
-	return _normalize_key(keys[0]) if keys else None
+
+	query = urlparse(file_url).query
+
+	for parameter in query.split("&"):
+		name, separator, value = parameter.partition("=")
+
+		if not separator:
+			continue
+
+		if unquote(name) == "key":
+			# _normalize_key uses unquote(), not unquote_plus(), so '+' is preserved.
+			return _normalize_key(value)
+
+	return None
 
 
 def _content_disposition(filename):
