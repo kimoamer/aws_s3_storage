@@ -380,50 +380,67 @@ def move_object_privacy(file_doc):
 
 @frappe.whitelist(allow_guest=True)
 def download_file(key=None):
-	"""Serve an S3 file while preserving literal '+' characters in its key."""
+    """Serve an S3 file while preserving literal '+' characters in its key."""
 
-	raw_query = ""
+    raw_query = ""
 
-	if frappe.request:
-		raw_query = frappe.request.query_string or b""
+    if frappe.request:
+        raw_query = frappe.request.query_string or b""
 
-		if isinstance(raw_query, bytes):
-			raw_query = raw_query.decode("utf-8", errors="replace")
+        if isinstance(raw_query, bytes):
+            raw_query = raw_query.decode("utf-8", errors="replace")
 
-	# Read directly from the raw query string.
-	# This prevents Werkzeug/Frappe from treating '+' as a space.
-	raw_key = _extract_key(f"/?{raw_query}") if raw_query else None
+    raw_key = _extract_key(f"/?{raw_query}") if raw_query else None
 
-	key = raw_key or _normalize_key(key)
+    key = raw_key or _normalize_key(key)
 
-	if not key or not key.startswith(SERVABLE_PREFIXES):
-		raise frappe.PermissionError
+    if not key or not key.startswith(SERVABLE_PREFIXES):
+        raise frappe.PermissionError
 
-	settings = frappe.get_single("S3 Settings")
+    settings = frappe.get_single("S3 Settings")
 
-	if key.startswith("private/"):
-		# Exact-match lookup on the indexed key columns (no LIKE); the key may be a
-		# File's main object or its thumbnail.
-		file_name = frappe.db.get_value("File", {"s3_key": key}, "name") or frappe.db.get_value(
-			"File", {"s3_thumbnail_key": key}, "name"
-		)
-		if not file_name:
-			raise frappe.PermissionError
-		frappe.get_doc("File", file_name).check_permission("read")
+    if key.startswith("private/"):
+        file_names = frappe.db.sql_list(
+            """
+            SELECT `name`
+            FROM `tabFile`
+            WHERE `s3_key` = %(key)s
+               OR `s3_thumbnail_key` = %(key)s
+            """,
+            {"key": key},
+        )
 
-	s3 = get_s3_client()
-	presigned_url = s3.generate_presigned_url(
-		"get_object",
-		Params={
-			"Bucket": settings.bucket_name,
-			"Key": key,
-			"ResponseContentDisposition": _content_disposition(key.rsplit("/", 1)[-1]),
-		},
-		ExpiresIn=_presigned_expiry(settings),
-	)
+        if not file_names:
+            raise frappe.PermissionError
 
-	frappe.local.response["type"] = "redirect"
-	frappe.local.response["location"] = presigned_url
+        has_access = False
+
+        for file_name in file_names:
+            file_doc = frappe.get_doc("File", file_name)
+
+            if file_doc.has_permission("read"):
+                has_access = True
+                break
+
+        if not has_access:
+            raise frappe.PermissionError
+
+    s3 = get_s3_client()
+
+    presigned_url = s3.generate_presigned_url(
+        "get_object",
+        Params={
+            "Bucket": settings.bucket_name,
+            "Key": key,
+            "ResponseContentDisposition": _content_disposition(
+                key.rsplit("/", 1)[-1]
+            ),
+        },
+        ExpiresIn=_presigned_expiry(settings),
+    )
+
+    frappe.local.response["type"] = "redirect"
+    frappe.local.response["location"] = presigned_url
 
 
 @frappe.whitelist()
