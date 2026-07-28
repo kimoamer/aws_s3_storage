@@ -3,12 +3,12 @@ app_title = "Aws S3 Storage"
 app_publisher = "Innomate LLC"
 app_description = "AWS S3 integration"
 app_email = "a.amer@innomate-tech.com"
-app_license = "mit"
+app_license = "MIT"
 
 # Apps
 # ------------------
 
-# required_apps = []
+required_apps = ["frappe"]
 
 # Each item in the list will be shown as an app in the apps page
 # add_to_apps_screen = [
@@ -70,6 +70,9 @@ app_license = "mit"
 # automatically create page for each record of this doctype
 # website_generators = ["Web Page"]
 
+# automatically load and sync documents of this doctype from downstream apps
+# importable_doctypes = [doctype_1]
+
 # Jinja
 # ----------
 
@@ -108,6 +111,12 @@ after_migrate = "aws_s3_storage.aws_s3_storage.install.after_migrate"
 # before_app_uninstall = "aws_s3_storage.utils.before_app_uninstall"
 # after_app_uninstall = "aws_s3_storage.utils.after_app_uninstall"
 
+# Build
+# ------------------
+# To hook into the build process
+
+# after_build = "aws_s3_storage.build.after_build"
+
 # Desk Notifications
 # ------------------
 # See frappe.core.notifications.get_notification_config
@@ -126,10 +135,16 @@ after_migrate = "aws_s3_storage.aws_s3_storage.install.after_migrate"
 # 	"Event": "frappe.desk.doctype.event.event.has_permission",
 # }
 
-# DocType Class
-# ---------------
-# Override standard doctype classes
+# Extend DocType Class
+# ------------------------------
+#
+# Specify custom mixins to extend the standard doctype controller.
+# extend_doctype_class = {
+# 	"Task": "aws_s3_storage.custom.task.CustomTaskMixin"
+# }
 
+# Override standard doctype classes
+# ------------------------------
 override_doctype_class = {"File": "aws_s3_storage.aws_s3_storage.file_override.S3File"}
 
 # Document Events

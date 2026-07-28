@@ -99,7 +99,7 @@ class S3File(File):
 			return True
 		return super().validate_file_on_disk()
 
-	def get_content(self) -> bytes:
+	def get_content(self, encodings=None) -> bytes | str:
 		if not self.get("content") and self.file_url:
 			key = s3_utils._extract_key(self.file_url)
 			if key:
@@ -110,7 +110,7 @@ class S3File(File):
 				except (UnicodeDecodeError, AttributeError):
 					self._content = content
 				return self._content
-		return super().get_content()
+		return super().get_content(encodings=encodings)
 
 	def exists_on_disk(self):
 		# An S3-backed record is considered "present" so Frappe's content-hash
