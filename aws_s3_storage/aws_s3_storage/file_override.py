@@ -6,7 +6,7 @@ from io import BytesIO
 import frappe
 from frappe.core.doctype.file.file import File
 
-from aws_s3_storage.aws_s3_storage import s3_utils
+from aws_s3_storage.aws_s3_storage import s3_utils, storage_router
 
 
 class S3File(File):
@@ -16,6 +16,7 @@ class S3File(File):
 	moving remote files when privacy changes, and can't detect S3 objects for
 	deduplication. Each of those is routed through boto3 instead.
 	"""
+
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
 
@@ -36,6 +37,7 @@ class S3File(File):
 					self._content = s3_utils.read_file_from_s3(key)
 
 		return super().check_content()
+
 	@property
 	def is_remote_file(self):
 		# Older Frappe (e.g. v15.69) only treats http(s) URLs as remote, so our
@@ -51,27 +53,23 @@ class S3File(File):
 		# Capture the key before Frappe's File.before_insert() applies unquote()
 		# to file_url. This is especially important when copying attachments
 		# during Amend, where an encoded %2B can otherwise become a raw '+'.
-		existing_key = (
-			s3_utils._extract_key(self.file_url)
-			or self.get("s3_key")
+		existing_key = s3_utils._extract_key(self.file_url) or self.get("s3_key")
+
+		existing_thumbnail_key = s3_utils._extract_key(self.get("thumbnail_url")) or self.get(
+			"s3_thumbnail_key"
 		)
-	
-		existing_thumbnail_key = (
-			s3_utils._extract_key(self.get("thumbnail_url"))
-			or self.get("s3_thumbnail_key")
-		)
-	
+
 		super().before_insert()
-	
+
 		# Rebuild canonical encoded URLs after Frappe has processed the copied File.
 		if existing_key:
 			self.s3_key = existing_key
 			self.file_url = s3_utils._build_file_url(existing_key)
-	
+
 		if existing_thumbnail_key:
 			self.s3_thumbnail_key = existing_thumbnail_key
 			self.thumbnail_url = s3_utils._build_file_url(existing_thumbnail_key)
-	
+
 		self._backfill_s3_keys()
 
 	def _backfill_s3_keys(self):
@@ -83,6 +81,29 @@ class S3File(File):
 			thumb_key = s3_utils._extract_key(self.thumbnail_url)
 			if thumb_key:
 				self.s3_thumbnail_key = thumb_key
+
+	def save_file(
+		self,
+		content=None,
+		decode=False,
+		ignore_existing_file_check=False,
+		overwrite=False,
+	):
+		"""Keep filesystem-dependent internal files out of S3 deduplication.
+
+		Frappe performs content-hash deduplication before invoking the configured
+		write hook. Without this guard, a repost file can inherit an existing S3
+		URL and never reach the local-storage router.
+		"""
+		if storage_router.should_store_locally(self):
+			ignore_existing_file_check = True
+
+		return super().save_file(
+			content=content,
+			decode=decode,
+			ignore_existing_file_check=ignore_existing_file_check,
+			overwrite=overwrite,
+		)
 
 	def get_full_path(self):
 		# Frappe's get_full_path() runs the "/api/method/..." URL through is_safe_path()
