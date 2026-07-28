@@ -36,6 +36,23 @@ class S3File(File):
 					self._content = s3_utils.read_file_from_s3(key)
 
 		return super().check_content()
+
+	def save_file(self, *args, **kwargs):
+		# Frappe's content-hash deduplication runs *before* the write_file hook, so a
+		# file that must stay on disk could still inherit another record's S3 URL (and
+		# then fail when its owner reopens it by path). It would also make two records
+		# share one file, and these are rewritten in place. Always give them their own.
+		#
+		# The arguments are passed straight through (ignore_existing_file_check is the
+		# third one) so this keeps working if Frappe's signature changes.
+		if s3_utils.is_local_only_file(self):
+			if len(args) >= 3:
+				args = (*args[:2], True, *args[3:])
+			else:
+				kwargs["ignore_existing_file_check"] = True
+
+		return super().save_file(*args, **kwargs)
+
 	@property
 	def is_remote_file(self):
 		# Older Frappe (e.g. v15.69) only treats http(s) URLs as remote, so our

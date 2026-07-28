@@ -207,7 +207,44 @@ share one object), and a delete that fails is queued in **S3 Deletion Queue** an
 retried hourly so nothing is orphaned. Objects uploaded inside a transaction that
 rolls back are cleaned up automatically.
 
-### 5. Migrating existing local files
+### 5. Attachments that deliberately stay on local disk
+
+A few attachments are not opaque blobs: the app that owns them reopens the file
+**by path** and rewrites it in place. ERPNext's **reposting data file** is the
+known case — `erpnext/stock/stock_ledger.py` does
+
+```python
+path = file_doc.get_full_path()
+with open(path, "wb") as f: ...
+```
+
+after every reposting batch. An S3-backed File has no path on disk, so every
+repost fails with `FileNotFoundError: [Errno 2] No such file or directory:
+'/api/method/…download_file?key=private/…/repost_item_valuation-….json.gz'`.
+
+These files therefore **bypass S3 and use Frappe's local storage**:
+
+| Rule | Value |
+| --- | --- |
+| `attached_to_doctype` | `Repost Item Valuation` |
+| `attached_to_field` | `reposting_data_file` |
+| File name | `repost_item_valuation-*.json.gz` |
+
+They are small, short-lived, and ERPNext deletes them once the repost finishes,
+so nothing meaningful accumulates on disk. Content-hash deduplication is also
+skipped for them (two Repost Item Valuations must never share one file), and the
+migration jobs never move them into the bucket.
+
+Files uploaded to S3 *before* this rule existed are brought back to disk
+automatically by the `move_local_only_files_to_disk` patch on `bench migrate`:
+each object is downloaded, written to `private/files`, the File record and the
+linked field are repointed, and the object is then removed from the bucket.
+
+To keep another app's attachment local, add its doctype or fieldname to
+`LOCAL_ONLY_ATTACHED_TO_DOCTYPES` / `LOCAL_ONLY_ATTACHED_TO_FIELDS` in
+`aws_s3_storage/aws_s3_storage/s3_utils.py`.
+
+### 6. Migrating existing local files
 
 Files that were uploaded **before** installing the app stay on local disk. Move
 them into S3 from **S3 Settings → S3 Operations**, which walks the safe order:
