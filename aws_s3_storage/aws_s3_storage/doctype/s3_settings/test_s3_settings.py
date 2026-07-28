@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import frappe
 from botocore.exceptions import ClientError
+from frappe.core.doctype.file.file import File
 from frappe.tests.utils import FrappeTestCase
 
 from aws_s3_storage.aws_s3_storage import s3_utils
@@ -132,6 +133,96 @@ class TestS3Settings(FrappeTestCase):
 			s3_utils.write_file_to_s3("x.txt", b"data")
 		client.assert_not_called()
 		fallback.assert_called_once()
+
+	# --- attachments that must stay on local disk --------------------------
+
+	def test_is_local_only_file_detects_repost_attachment(self):
+		# ERPNext rewrites this one in place by path, so it can never live in S3.
+		self.assertTrue(
+			s3_utils.is_local_only_file(frappe._dict(attached_to_doctype="Repost Item Valuation"))
+		)
+		self.assertTrue(s3_utils.is_local_only_file(frappe._dict(attached_to_field="reposting_data_file")))
+		# Filename fallback, for callers that pass no attachment link at all.
+		self.assertTrue(s3_utils.is_local_only_file(fname="repost_item_valuation-3a7f0c1.json.gz"))
+
+	def test_is_local_only_file_false_for_normal_attachment(self):
+		self.assertFalse(s3_utils.is_local_only_file(frappe._dict()))
+		self.assertFalse(s3_utils.is_local_only_file(fname="invoice.pdf"))
+		self.assertFalse(
+			s3_utils.is_local_only_file(
+				frappe._dict(
+					attached_to_doctype="Sales Invoice",
+					attached_to_field="scanned_copy",
+					file_name="report.json.gz",
+				)
+			)
+		)
+
+	def test_write_keeps_repost_data_file_local(self):
+		frappe.db.set_single_value("S3 Settings", "enabled", 1)
+		doc = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": "repost_item_valuation-3a7f0c1.json.gz",
+				"attached_to_doctype": "Repost Item Valuation",
+				"attached_to_name": "3a7f0c1",
+				"attached_to_field": "reposting_data_file",
+				"is_private": 1,
+			}
+		)
+		with (
+			patch.object(s3_utils, "get_s3_client") as client,
+			patch.object(
+				s3_utils, "_save_to_filesystem", return_value={"file_url": "/private/files/x.json.gz"}
+			) as fallback,
+		):
+			result = s3_utils.write_file_to_s3(doc)
+
+		client.assert_not_called()
+		fallback.assert_called_once()
+		self.assertEqual(result["file_url"], "/private/files/x.json.gz")
+
+	def test_local_only_file_skips_dedup(self):
+		# Dedup runs before the write_file hook: reusing an existing (S3) object here
+		# would hand the reposting file an /api/method URL it can't open by path.
+		from aws_s3_storage.aws_s3_storage.file_override import S3File
+
+		f = S3File(
+			{
+				"doctype": "File",
+				"file_name": "repost_item_valuation-3a7f0c1.json.gz",
+				"attached_to_doctype": "Repost Item Valuation",
+				"attached_to_field": "reposting_data_file",
+				"is_private": 1,
+			}
+		)
+		with patch.object(File, "save_file") as parent:
+			f.save_file(content=b"x")
+		self.assertTrue(parent.call_args.kwargs["ignore_existing_file_check"])
+
+	def test_normal_file_keeps_dedup(self):
+		from aws_s3_storage.aws_s3_storage.file_override import S3File
+
+		f = S3File({"doctype": "File", "file_name": "invoice.pdf", "is_private": 1})
+		with patch.object(File, "save_file") as parent:
+			f.save_file(content=b"x")
+		self.assertFalse(parent.call_args.kwargs.get("ignore_existing_file_check"))
+
+	def test_migration_skips_local_only_file(self):
+		# The daily migration must not move a local-only file into S3 later on.
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		doc = frappe._dict(
+			name="F1",
+			is_folder=0,
+			s3_key=None,
+			file_url="/private/files/repost_item_valuation-3a7f0c1.json.gz",
+			file_name="repost_item_valuation-3a7f0c1.json.gz",
+			attached_to_doctype="Repost Item Valuation",
+			attached_to_field="reposting_data_file",
+		)
+		with patch.object(frappe, "get_doc", return_value=doc):
+			self.assertEqual(migrate.migrate_file("F1"), "skipped")
 
 	# --- write_file_to_s3 --------------------------------------------------
 

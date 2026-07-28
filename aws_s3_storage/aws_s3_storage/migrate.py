@@ -16,6 +16,9 @@ Every migrated File gets its ``s3_key`` set, so the pending query naturally
 excludes it — the job is safe to stop and resume. Files whose content is missing
 are skipped for the rest of a run instead of looping. Uploads stream from disk
 (multipart), so a large file does not have to fit in memory.
+
+Attachments that an app rewrites in place by path (see
+``s3_utils.is_local_only_file``) are always skipped: they have to stay on disk.
 """
 
 import mimetypes
@@ -341,6 +344,11 @@ def migrate_file(name, delete_local=0, s3=None, settings=None):
 	doc = frappe.get_doc("File", name)
 
 	if doc.is_folder or doc.get("s3_key") or s3_utils._extract_key(doc.file_url):
+		return "skipped"
+
+	# Some attachments are rewritten in place by path and must stay on disk
+	# (ERPNext's reposting data file) — migrating them would break the owning app.
+	if s3_utils.is_local_only_file(doc):
 		return "skipped"
 
 	old_main_url = doc.file_url

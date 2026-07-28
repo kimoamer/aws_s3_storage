@@ -3,6 +3,7 @@ import hashlib
 import mimetypes
 import os
 import uuid
+from fnmatch import fnmatch
 from urllib.parse import quote, unquote, urlparse
 
 import boto3
@@ -227,6 +228,47 @@ def object_exists(key, expected_size=None, s3=None, bucket=None):
 
 
 # ---------------------------------------------------------------------------
+# Attachments that must stay on the local disk
+# ---------------------------------------------------------------------------
+# Most apps treat an attachment as an opaque blob and read it back through the
+# File API, which works fine from S3. A few instead reopen the file *by path* and
+# rewrite it in place. ERPNext's reposting data file is the known case:
+# erpnext/stock/stock_ledger.py:create_json_gz_file() does
+#
+#     path = file_doc.get_full_path()
+#     with open(path, "wb") as f: ...
+#
+# after every reposting batch, so the attachment has to be a real path on disk —
+# an S3-backed File makes every repost fail with FileNotFoundError. Files matching
+# the rules below therefore bypass S3 and use Frappe's local storage. They are
+# small, short-lived and deleted by ERPNext once the repost finishes.
+#
+# To keep another app's attachment local, add its doctype/fieldname here.
+LOCAL_ONLY_ATTACHED_TO_DOCTYPES = {"Repost Item Valuation"}
+LOCAL_ONLY_ATTACHED_TO_FIELDS = {"reposting_data_file"}
+# Fallback for callers that pass only a filename (the legacy file_manager
+# convention), where the attachment link is not available.
+LOCAL_ONLY_FILENAME_PATTERNS = ("repost_item_valuation-*.json.gz",)
+
+
+def is_local_only_file(file_doc=None, fname=None):
+	"""True when this attachment must be stored on local disk instead of S3.
+
+	``file_doc`` may be a File Document or any dict-like row carrying the
+	``attached_to_*`` fields; ``fname`` alone is enough for the filename rules.
+	"""
+	if file_doc is not None:
+		if (file_doc.get("attached_to_doctype") or "") in LOCAL_ONLY_ATTACHED_TO_DOCTYPES:
+			return True
+		if (file_doc.get("attached_to_field") or "") in LOCAL_ONLY_ATTACHED_TO_FIELDS:
+			return True
+		fname = fname or file_doc.get("file_name")
+
+	fname = (fname or "").lower()
+	return any(fnmatch(fname, pattern) for pattern in LOCAL_ONLY_FILENAME_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
 # Write / read
 # ---------------------------------------------------------------------------
 
@@ -242,20 +284,20 @@ def write_file_to_s3(file_or_fname, content=None, content_type=None, is_private=
 	  ``write_file_to_s3(fname, content, content_type=..., is_private=...)``
 	"""
 	settings = frappe.get_single("S3 Settings")
+
+	file_doc = file_or_fname if isinstance(file_or_fname, Document) else None
+	fname = file_doc.file_name if file_doc is not None else file_or_fname
+
 	# Master switch: when disabled — or before a bucket is configured — fall back to
-	# Frappe's default local storage instead of failing the upload.
-	if not _is_enabled(settings) or not settings.bucket_name:
+	# Frappe's default local storage instead of failing the upload. Attachments that
+	# an app rewrites in place by path (see is_local_only_file) take the same route.
+	if not _is_enabled(settings) or not settings.bucket_name or is_local_only_file(file_doc, fname):
 		return _save_to_filesystem(file_or_fname, content, content_type, is_private)
 
-	file_doc = None
-	if isinstance(file_or_fname, Document):
-		file_doc = file_or_fname
-		fname = file_doc.file_name
+	if file_doc is not None:
 		content = file_doc.get_content()
 		content_type = getattr(file_doc, "content_type", None)
 		is_private = file_doc.is_private
-	else:
-		fname = file_or_fname
 
 	# boto3 needs bytes; normalise so the reported file_size and MD5 are accurate.
 	if isinstance(content, str):
