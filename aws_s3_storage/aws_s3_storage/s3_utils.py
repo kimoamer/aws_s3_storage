@@ -383,7 +383,10 @@ def move_object_privacy(file_doc):
 	The old objects are deleted only after commit; the new copies are removed if the
 	transaction rolls back.
 	"""
-	old_key = _extract_key(file_doc.file_url)
+	# Prefer the stored keys: by the time Frappe calls this (inside File.validate)
+	# it has already run unquote() over file_url, so a key holding '&' or '#' would
+	# parse back short and the move would target an object that does not exist.
+	old_key = file_doc.get("s3_key") or _extract_key(file_doc.file_url)
 	if not old_key:
 		return
 
@@ -400,7 +403,7 @@ def move_object_privacy(file_doc):
 	file_doc.file_url = _build_file_url(new_key)
 	file_doc.s3_key = new_key
 
-	old_thumb = _extract_key(file_doc.get("thumbnail_url"))
+	old_thumb = file_doc.get("s3_thumbnail_key") or _extract_key(file_doc.get("thumbnail_url"))
 	if old_thumb:
 		new_thumb = _swap_prefix(old_thumb, file_doc.is_private)
 		copy_object(old_thumb, new_thumb, settings=settings, s3=s3, bucket=bucket)

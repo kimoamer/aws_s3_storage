@@ -4,6 +4,7 @@
 from io import BytesIO
 
 import frappe
+from botocore.exceptions import ClientError
 from frappe.core.doctype.file.file import File
 
 from aws_s3_storage.aws_s3_storage import s3_utils
@@ -24,6 +25,65 @@ class S3File(File):
 		# S3 object without loading its content first.
 		self._content = getattr(self, "_content", None)
 
+	def _key(self):
+		"""The record's S3 key, preferring the stored column over the URL.
+
+		File.validate() runs ``self.file_url = unquote(self.file_url)`` before the
+		rest of validation, so mid-save the URL is no longer the canonical encoded
+		one this app writes. A key containing '&' or '#' then parses short (the
+		query splits on '&', urlparse cuts at '#') and every read of it 404s, even
+		though the stored record is perfectly fine. The s3_key column is not
+		URL-encoded and cannot be mangled that way, so it is the better source.
+		"""
+		return self.get("s3_key") or s3_utils._extract_key(self.file_url)
+
+	def _read_s3(self, key, required=True):
+		"""Read an object, telling "it is gone" apart from a real S3 failure.
+
+		A File row can outlive its object (deleted from the bucket, a lifecycle
+		rule, a site restored against another bucket). Frappe simply skips the PDF
+		scan when a file has no content, so a missing object must not be fatal
+		there: Document.copy_attachments_from_amended_from() re-inserts every
+		attachment as a new File, and one orphaned pointer would otherwise block
+		every Amend of the document it hangs off.
+		"""
+		try:
+			return s3_utils.read_file_from_s3(key)
+		except ClientError as e:
+			if e.response.get("Error", {}).get("Code") not in s3_utils._NOT_FOUND_CODES:
+				raise
+
+			# get(): a File being inserted has no name yet on every code path.
+			frappe.logger().warning(
+				f"aws_s3_storage: object missing for File {self.get('name') or self.get('file_name')}: {key}"
+			)
+			if required:
+				# Same failure mode Frappe gives for a missing local file, but naming
+				# the attachment and the key instead of a raw botocore error.
+				raise FileNotFoundError(
+					f"Attachment '{self.get('file_name')}' is not in the S3 bucket (key: {key})"
+				) from e
+
+			return None
+
+	def validate(self):
+		super().validate()
+		self._restore_canonical_urls()
+
+	def _restore_canonical_urls(self):
+		"""Undo the ``unquote()`` Frappe applies to file_url at the top of validate().
+
+		Left alone, the decoded URL is what gets written to the database, so a file
+		whose name contains '&' or '#' ends up with a URL that no longer parses back
+		to its own key — the record then 404s on download even though the object is
+		untouched. Rebuilding from the (unencoded) keys keeps the stored URLs
+		canonical no matter how often the record is saved.
+		"""
+		if self.get("s3_key"):
+			self.file_url = s3_utils._build_file_url(self.s3_key)
+		if self.get("s3_thumbnail_key"):
+			self.thumbnail_url = s3_utils._build_file_url(self.s3_thumbnail_key)
+
 	def check_content(self):
 		"""Load S3-backed PDF content before Frappe performs its security check."""
 
@@ -31,9 +91,11 @@ class S3File(File):
 			if self.get("content"):
 				self._content = self.get_content()
 			else:
-				key = s3_utils._extract_key(self.file_url)
+				key = self._key()
 				if key:
-					self._content = s3_utils.read_file_from_s3(key)
+					# No content -> Frappe skips the scan, exactly as for a local file
+					# it cannot read. Never fail the whole save over it.
+					self._content = self._read_s3(key, required=False)
 
 		return super().check_content()
 
@@ -60,14 +122,31 @@ class S3File(File):
 		# path and rejected ("The File URL you've entered is incorrect"). Recognising
 		# it here makes validate_file_path / validate_file_url short-circuit on every
 		# Frappe 15 build, old or new.
-		if self.file_url and s3_utils._extract_key(self.file_url):
+		if self._key():
 			return True
 		return super().is_remote_file
 
+	def set_is_private(self):
+		# Frappe derives privacy from the URL (`file_url.startswith("/private")`),
+		# which is always false for our "/api/method/..." URLs — so an attachment
+		# copied onto another document (Amend) silently arrives as public. The key's
+		# own prefix is where privacy actually lives for an S3 object, so read it
+		# from there instead. Only insert is affected: Frappe does not call this on
+		# update, so a deliberate privacy change still goes through untouched.
+		key = self._key()
+		if not key:
+			return super().set_is_private()
+
+		if key.startswith("private/"):
+			self.is_private = 1
+		elif key.startswith("public/"):
+			self.is_private = 0
+
 	def before_insert(self):
-		# Capture the key before Frappe's File.before_insert() applies unquote()
-		# to file_url. This is especially important when copying attachments
-		# during Amend, where an encoded %2B can otherwise become a raw '+'.
+		# Capture the key before Frappe applies unquote() to file_url (in validate()
+		# on v15.80, in before_insert() on newer builds). This is especially important
+		# when copying attachments during Amend, where an encoded %2B can otherwise
+		# become a raw '+'.
 		existing_key = (
 			s3_utils._extract_key(self.file_url)
 			or self.get("s3_key")
@@ -106,21 +185,21 @@ class S3File(File):
 		# and rejects it ("Cannot access file path") while saving the record. For an
 		# S3-backed file the URL *is* the location, so return it directly and skip the
 		# local-filesystem path handling.
-		if s3_utils._extract_key(self.file_url):
+		if self._key():
 			return self.file_url
 		return super().get_full_path()
 
 	def validate_file_on_disk(self):
 		# S3-backed files never live on the local disk.
-		if s3_utils._extract_key(self.file_url):
+		if self._key():
 			return True
 		return super().validate_file_on_disk()
 
 	def get_content(self) -> bytes:
 		if not self.get("content") and self.file_url:
-			key = s3_utils._extract_key(self.file_url)
+			key = self._key()
 			if key:
-				content = s3_utils.read_file_from_s3(key)
+				content = self._read_s3(key)
 				# Mirror Frappe's behaviour of returning text as str when decodable.
 				try:
 					self._content = content.decode()
@@ -132,7 +211,7 @@ class S3File(File):
 	def exists_on_disk(self):
 		# An S3-backed record is considered "present" so Frappe's content-hash
 		# deduplication reuses the existing object instead of re-uploading it.
-		if s3_utils._extract_key(self.file_url):
+		if self._key():
 			return True
 		return super().exists_on_disk()
 
@@ -140,10 +219,18 @@ class S3File(File):
 		# Frappe's default skips remote files (ours are remote), which would leave the
 		# object under the wrong prefix and, worse, a "private" record reachable under
 		# public/. Move the object to match the new privacy instead.
-		if s3_utils._extract_key(self.file_url):
-			s3_utils.move_object_privacy(self)
+		if not self._key():
+			return super().handle_is_private_changed()
+
+		if not self.get_doc_before_save():
+			# Frappe reaches this during insert as well: is_new() returns None for a
+			# document built from a dict (as Amend does) and has_value_changed() is
+			# True whenever there is nothing to compare against. A record being
+			# inserted has no previous privacy, so there is nothing to move — the key
+			# it points at already carries the right prefix (see set_is_private).
 			return
-		return super().handle_is_private_changed()
+
+		s3_utils.move_object_privacy(self)
 
 	def make_thumbnail(
 		self,
@@ -153,7 +240,7 @@ class S3File(File):
 		suffix: str = "small",
 		crop: bool = False,
 	) -> str | None:
-		key = s3_utils._extract_key(self.file_url) if self.file_url else None
+		key = self._key()
 		if not key:
 			# Local file — Frappe's default (disk-based) thumbnailing is fine.
 			return super().make_thumbnail(set_as_thumbnail, width, height, suffix, crop)
