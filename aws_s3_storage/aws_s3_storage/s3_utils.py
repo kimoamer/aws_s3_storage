@@ -383,7 +383,10 @@ def move_object_privacy(file_doc):
 	The old objects are deleted only after commit; the new copies are removed if the
 	transaction rolls back.
 	"""
-	old_key = _extract_key(file_doc.file_url)
+	# Prefer the stored keys: by the time Frappe calls this (inside File.validate)
+	# it has already run unquote() over file_url, so a key holding '&' or '#' would
+	# parse back short and the move would target an object that does not exist.
+	old_key = file_doc.get("s3_key") or _extract_key(file_doc.file_url)
 	if not old_key:
 		return
 
@@ -400,7 +403,7 @@ def move_object_privacy(file_doc):
 	file_doc.file_url = _build_file_url(new_key)
 	file_doc.s3_key = new_key
 
-	old_thumb = _extract_key(file_doc.get("thumbnail_url"))
+	old_thumb = file_doc.get("s3_thumbnail_key") or _extract_key(file_doc.get("thumbnail_url"))
 	if old_thumb:
 		new_thumb = _swap_prefix(old_thumb, file_doc.is_private)
 		copy_object(old_thumb, new_thumb, settings=settings, s3=s3, bucket=bucket)
@@ -546,15 +549,66 @@ def _delete_keys(bucket, keys, check_references=False):
 	s3 = get_s3_client()
 	for key in keys:
 		# Never delete an object another File still points at (dedup / shared use).
-		if check_references and (
-			frappe.db.exists("File", {"s3_key": key}) or frappe.db.exists("File", {"s3_thumbnail_key": key})
-		):
+		if check_references and _key_is_referenced(key):
 			continue
 		try:
 			s3.delete_object(Bucket=bucket, Key=key)
 		except Exception as e:
 			frappe.logger().error(f"S3 Delete Error for {key}: {e}")
 			_queue_deletion(bucket, key, str(e))
+
+
+def _key_is_referenced(key):
+	"""True when any File record still points at this object.
+
+	Deduplicated uploads share one object, and so does every Amend of a document:
+	the copied attachment is a new File record on the original's key. Removing the
+	object for one of them breaks all the others.
+
+	The key columns only cover records written through this app's File lifecycle;
+	one written directly (db_set, SQL) carries the key in its URL alone, so the URLs
+	are checked as well before anything is deleted.
+	"""
+	if frappe.db.exists("File", {"s3_key": key}) or frappe.db.exists("File", {"s3_thumbnail_key": key}):
+		return True
+
+	rows = frappe.db.sql(
+		"""
+		SELECT `file_url`, `thumbnail_url`
+		FROM `tabFile`
+		WHERE `file_url` LIKE %(pattern)s OR `thumbnail_url` LIKE %(pattern)s
+		""",
+		{"pattern": f"%{_url_match_token(key)}%"},
+	)
+	# The LIKE only narrows the scan (a file name may itself hold SQL wildcards);
+	# each candidate is decoded and compared properly below.
+	return any(
+		_url_references_key(file_url, key) or _url_references_key(thumbnail_url, key)
+		for file_url, thumbnail_url in rows
+	)
+
+
+def _url_match_token(key):
+	"""The part of a key that survives URL-encoding, used to narrow the scan.
+
+	Keys are "<prefix>/<uuid>/<filename>" (_new_key) and quote() never rewrites the
+	uuid hex, so matching on it stays selective whatever the file is called.
+	"""
+	parts = key.split("/")
+	if len(parts) >= 3 and parts[0] in ("public", "private") and parts[1]:
+		return parts[1]
+	return key
+
+
+def _url_references_key(file_url, key):
+	url_key = _extract_key(file_url)
+	if not url_key:
+		return False
+
+	# A URL that Frappe has unquoted parses back short when the name holds '&' or
+	# '#' (see S3File._key), so a truncated key counts as a reference too: keeping
+	# an object nothing uses any more is always cheaper than deleting a live one.
+	return key == url_key or key.startswith(url_key)
 
 
 def _queue_deletion(bucket, key, error=None):
