@@ -243,6 +243,29 @@ too: no object is moved and no `file_url` changes — which matters, because tha
 URL is stored inside the document's own Attach field and rewriting it would break
 every existing link.
 
+#### When a link has no File record left
+
+The rule above needs a File record to reason about. An attachment can lose one —
+a Web Form upload whose File was never created, a value written into an Attach
+field with `db_set`/SQL, or a File deleted while another document still held its
+URL. The URL then 403s for **everyone**, not just for a Guest, because there is
+nothing left to check permission against.
+
+The `restore_missing_file_records` patch repairs that on `bench migrate`. It walks
+every stored Attach / Attach Image field and, for each S3 link with no File record:
+
+- recreates the record **attached to the document that references it**, so read
+  permission flows from that document like any normal attachment, or
+- prints the link when the object is gone from the bucket too — that one cannot be
+  repaired, the file has to be uploaded again.
+
+No object is written and no URL is rewritten; only the missing rows come back. It
+is idempotent, and can be re-run at any time:
+
+```bash
+bench --site <site> execute aws_s3_storage.patches.v1_0.restore_missing_file_records.execute
+```
+
 ### 5. Attachments that deliberately stay on local disk
 
 A few attachments are not opaque blobs: the app that owns them reopens the file

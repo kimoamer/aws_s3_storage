@@ -785,6 +785,67 @@ class TestS3Settings(FrappeTestCase):
 			if os.path.exists(tmp.name):
 				os.unlink(tmp.name)
 
+	# --- restoring File records a document still links to -------------------
+
+	@contextmanager
+	def _linked_rows(self, rows, covered_by=(), object_exists=True):
+		"""Run the patch over ``rows`` of one Attach field, faking every lookup."""
+		from aws_s3_storage.patches.v1_0 import restore_missing_file_records as repair
+
+		with (
+			patch.object(repair, "_attach_fields", return_value=[("Interview", "custom_resume_attachment")]),
+			patch.object(repair, "_linked_rows", return_value=rows),
+			patch.object(s3_utils, "_files_for_key", return_value=list(covered_by)),
+			patch.object(s3_utils, "object_exists", return_value=object_exists),
+			patch.object(s3_utils, "get_s3_client", return_value=MagicMock()),
+			patch.object(repair, "_restore_file") as restore,
+		):
+			yield restore
+
+	def _interview_row(self, key):
+		return frappe._dict(name="HR-INT-0001", owner="hr@example.com", value=s3_utils._build_file_url(key))
+
+	def test_patch_restores_record_for_orphaned_link(self):
+		from aws_s3_storage.patches.v1_0 import restore_missing_file_records as repair
+
+		key = "private/f5288607fbaa4ac4948da25797a7868c/Eslam_S_Cv_.pdf"
+		with self._linked_rows([self._interview_row(key)]) as restore:
+			repair.execute()
+
+		restore.assert_called_once()
+		doctype, fieldname, row, restored_key = restore.call_args[0]
+		self.assertEqual((doctype, fieldname), ("Interview", "custom_resume_attachment"))
+		self.assertEqual(restored_key, key)
+		self.assertEqual(row.name, "HR-INT-0001")
+
+	def test_patch_skips_link_already_covered_by_a_file_record(self):
+		from aws_s3_storage.patches.v1_0 import restore_missing_file_records as repair
+
+		rows = [self._interview_row("private/uid/cv.pdf")]
+		with self._linked_rows(rows, covered_by=["FILE-1"]) as restore:
+			repair.execute()
+		restore.assert_not_called()
+
+	def test_patch_reports_instead_of_restoring_a_deleted_object(self):
+		# Recreating a record for an object that is gone only turns a 403 into a 404.
+		from aws_s3_storage.patches.v1_0 import restore_missing_file_records as repair
+
+		rows = [self._interview_row("private/uid/cv.pdf")]
+		with self._linked_rows(rows, object_exists=False) as restore:
+			repair.execute()
+		restore.assert_not_called()
+
+	def test_patch_ignores_local_and_non_servable_values(self):
+		from aws_s3_storage.patches.v1_0 import restore_missing_file_records as repair
+
+		rows = [
+			frappe._dict(name="D1", owner="x", value="/files/local.pdf"),
+			frappe._dict(name="D2", owner="x", value=s3_utils._build_file_url("backups/site/db.sql.gz")),
+		]
+		with self._linked_rows(rows) as restore:
+			repair.execute()
+		restore.assert_not_called()
+
 	# --- backup sync -------------------------------------------------------
 
 	@patch.object(s3_utils, "get_s3_client")
