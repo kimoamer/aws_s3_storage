@@ -423,69 +423,136 @@ def move_object_privacy(file_doc):
 # ---------------------------------------------------------------------------
 
 
+def _files_for_key(key):
+	"""Names of every File record pointing at this object.
+
+	The indexed key columns are tried first. Records written before those columns
+	existed (or written directly with db_set / SQL) carry the key only inside their
+	URL, so fall back to the same URL matching used by the deletion guard —
+	otherwise a perfectly valid old attachment resolves to no record at all and is
+	refused even for a user who may read it.
+	"""
+	names = frappe.db.sql_list(
+		"""
+		SELECT `name`
+		FROM `tabFile`
+		WHERE `s3_key` = %(key)s
+		   OR `s3_thumbnail_key` = %(key)s
+		""",
+		{"key": key},
+	)
+	if names:
+		return names
+
+	rows = frappe.db.sql(
+		"""
+		SELECT `name`, `file_url`, `thumbnail_url`
+		FROM `tabFile`
+		WHERE `file_url` LIKE %(pattern)s OR `thumbnail_url` LIKE %(pattern)s
+		""",
+		{"pattern": f"%{_url_match_token(key)}%"},
+		as_dict=True,
+	)
+	return [
+		row.name
+		for row in rows
+		if _url_references_key(row.file_url, key) or _url_references_key(row.thumbnail_url, key)
+	]
+
+
+def _guest_may_read(file_doc, settings):
+	"""Whether the anonymous visitor may read this private object.
+
+	Frappe never grants a Guest read access to a private File (see
+	frappe/core/doctype/file/file.py:has_permission and download_private_file), so a
+	web form attachment uploaded by a visitor cannot be shown back to them — not in
+	the preview right after upload, and not on the submitted document.
+
+	This opt-in rule closes that gap without widening access for anyone else:
+	only objects whose File record is *owned by Guest* qualify, i.e. only what a
+	visitor uploaded themselves. The object stays private in the bucket and is still
+	served through a short-lived presigned URL; what protects it from other visitors
+	is the uuid4 in its key, exactly as it protects a public/ object today.
+	"""
+	if frappe.session.user != "Guest":
+		return False
+
+	if not cint(settings.get("allow_guest_downloads")):
+		return False
+
+	if (file_doc.get("owner") or "") != "Guest":
+		return False
+
+	allowed = {
+		doctype.strip()
+		for doctype in (settings.get("guest_upload_doctypes") or "").splitlines()
+		if doctype.strip()
+	}
+	attached_to = file_doc.get("attached_to_doctype") or ""
+
+	# An empty allowlist means "any guest upload". A file that is not attached to
+	# anything yet is always allowed through: that is the state of every upload
+	# between the file being sent and the web form being submitted, which is exactly
+	# the preview this rule exists for.
+	if allowed and attached_to and attached_to not in allowed:
+		return False
+
+	return True
+
+
 @frappe.whitelist(allow_guest=True)
 def download_file(key=None):
-    """Serve an S3 file while preserving literal '+' characters in its key."""
+	"""Serve an S3 file while preserving literal '+' characters in its key."""
 
-    raw_query = ""
+	raw_query = ""
 
-    if frappe.request:
-        raw_query = frappe.request.query_string or b""
+	if frappe.request:
+		raw_query = frappe.request.query_string or b""
 
-        if isinstance(raw_query, bytes):
-            raw_query = raw_query.decode("utf-8", errors="replace")
+		if isinstance(raw_query, bytes):
+			raw_query = raw_query.decode("utf-8", errors="replace")
 
-    raw_key = _extract_key(f"/?{raw_query}") if raw_query else None
+	raw_key = _extract_key(f"/?{raw_query}") if raw_query else None
 
-    key = raw_key or _normalize_key(key)
+	key = raw_key or _normalize_key(key)
 
-    if not key or not key.startswith(SERVABLE_PREFIXES):
-        raise frappe.PermissionError
+	if not key or not key.startswith(SERVABLE_PREFIXES):
+		raise frappe.PermissionError
 
-    settings = frappe.get_single("S3 Settings")
+	settings = frappe.get_single("S3 Settings")
 
-    if key.startswith("private/"):
-        file_names = frappe.db.sql_list(
-            """
-            SELECT `name`
-            FROM `tabFile`
-            WHERE `s3_key` = %(key)s
-               OR `s3_thumbnail_key` = %(key)s
-            """,
-            {"key": key},
-        )
+	if key.startswith("private/"):
+		file_names = _files_for_key(key)
 
-        if not file_names:
-            raise frappe.PermissionError
+		if not file_names:
+			raise frappe.PermissionError
 
-        has_access = False
+		has_access = False
 
-        for file_name in file_names:
-            file_doc = frappe.get_doc("File", file_name)
+		for file_name in file_names:
+			file_doc = frappe.get_doc("File", file_name)
 
-            if file_doc.has_permission("read"):
-                has_access = True
-                break
+			if file_doc.has_permission("read") or _guest_may_read(file_doc, settings):
+				has_access = True
+				break
 
-        if not has_access:
-            raise frappe.PermissionError
+		if not has_access:
+			raise frappe.PermissionError
 
-    s3 = get_s3_client()
+	s3 = get_s3_client()
 
-    presigned_url = s3.generate_presigned_url(
-        "get_object",
-        Params={
-            "Bucket": settings.bucket_name,
-            "Key": key,
-            "ResponseContentDisposition": _content_disposition(
-                key.rsplit("/", 1)[-1]
-            ),
-        },
-        ExpiresIn=_presigned_expiry(settings),
-    )
+	presigned_url = s3.generate_presigned_url(
+		"get_object",
+		Params={
+			"Bucket": settings.bucket_name,
+			"Key": key,
+			"ResponseContentDisposition": _content_disposition(key.rsplit("/", 1)[-1]),
+		},
+		ExpiresIn=_presigned_expiry(settings),
+	)
 
-    frappe.local.response["type"] = "redirect"
-    frappe.local.response["location"] = presigned_url
+	frappe.local.response["type"] = "redirect"
+	frappe.local.response["location"] = presigned_url
 
 
 @frappe.whitelist()

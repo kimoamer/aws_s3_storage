@@ -5,6 +5,7 @@ import base64
 import hashlib
 import os
 import tempfile
+from contextlib import contextmanager
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 
@@ -24,6 +25,32 @@ class TestS3Settings(FrappeTestCase):
 		frappe.db.set_single_value("S3 Settings", "verify_upload_integrity", 0)
 		frappe.db.set_single_value("S3 Settings", "presigned_url_expiry", 3600)
 		frappe.db.set_single_value("S3 Settings", "enable_backup_sync", 0)
+		frappe.db.set_single_value("S3 Settings", "allow_guest_downloads", 0)
+		frappe.db.set_single_value("S3 Settings", "guest_upload_doctypes", "")
+
+	# --- helpers -----------------------------------------------------------
+
+	@contextmanager
+	def _as_user(self, user):
+		original = frappe.session.user
+		frappe.session.user = user
+		try:
+			yield
+		finally:
+			frappe.session.user = original
+
+	@contextmanager
+	def _file_doc(self, file_doc):
+		"""Fake only the File lookup: get_single("S3 Settings") goes through get_doc too."""
+		real_get_doc = frappe.get_doc
+
+		def fake_get_doc(*args, **kwargs):
+			if args and args[0] == "File":
+				return file_doc
+			return real_get_doc(*args, **kwargs)
+
+		with patch.object(frappe, "get_doc", side_effect=fake_get_doc):
+			yield
 
 	# --- URL / key helpers -------------------------------------------------
 
@@ -305,22 +332,156 @@ class TestS3Settings(FrappeTestCase):
 				s3_utils.download_file(bad)
 
 	@patch.object(s3_utils, "get_s3_client")
-	def test_download_private_checks_permission_via_thumbnail_key(self, mock_get_client):
+	def test_download_private_checks_read_permission(self, mock_get_client):
 		s3 = MagicMock()
 		s3.generate_presigned_url.return_value = "https://signed.example/thumb"
 		mock_get_client.return_value = s3
 
-		def fake_get_value(doctype, filters, fieldname):
-			return "FILE-1" if "s3_thumbnail_key" in filters else None
+		file_doc = frappe._dict(owner="Administrator", has_permission=lambda ptype: True)
 
 		with (
-			patch.object(frappe.db, "get_value", side_effect=fake_get_value),
-			patch.object(frappe, "get_doc") as mock_get_doc,
+			patch.object(s3_utils, "_files_for_key", return_value=["FILE-1"]),
+			self._file_doc(file_doc),
 		):
 			s3_utils.download_file("private/uid/pic_small.png")
 
-		mock_get_doc.assert_called_once_with("File", "FILE-1")
-		mock_get_doc.return_value.check_permission.assert_called_once_with("read")
+		self.assertEqual(frappe.local.response["location"], "https://signed.example/thumb")
+
+	def test_download_private_refuses_without_read_permission(self):
+		file_doc = frappe._dict(owner="Administrator", has_permission=lambda ptype: False)
+
+		with (
+			patch.object(s3_utils, "_files_for_key", return_value=["FILE-1"]),
+			self._file_doc(file_doc),
+			self.assertRaises(frappe.PermissionError),
+		):
+			s3_utils.download_file("private/uid/secret.pdf")
+
+	def test_download_private_refuses_unknown_key(self):
+		with (
+			patch.object(s3_utils, "_files_for_key", return_value=[]),
+			self.assertRaises(frappe.PermissionError),
+		):
+			s3_utils.download_file("private/uid/not-a-record.pdf")
+
+	# --- legacy records without the s3_key column --------------------------
+
+	def test_files_for_key_falls_back_to_url_match(self):
+		# Uploaded before s3_key existed: the key lives only inside file_url, so the
+		# exact-column lookup finds nothing and the record must still resolve.
+		key = "private/uid123/report.pdf"
+		rows = [frappe._dict(name="FILE-1", file_url=s3_utils._build_file_url(key), thumbnail_url=None)]
+
+		with (
+			patch.object(frappe.db, "sql_list", return_value=[]),
+			patch.object(frappe.db, "sql", return_value=rows),
+		):
+			self.assertEqual(s3_utils._files_for_key(key), ["FILE-1"])
+
+	def test_files_for_key_drops_rows_the_like_only_narrowed(self):
+		# The LIKE matches on the uuid alone; a different object under the same uuid
+		# (e.g. its thumbnail's sibling) must not count as this key.
+		key = "private/uid123/report.pdf"
+		rows = [
+			frappe._dict(
+				name="FILE-2",
+				file_url=s3_utils._build_file_url("private/uid123/other.pdf"),
+				thumbnail_url=None,
+			)
+		]
+
+		with (
+			patch.object(frappe.db, "sql_list", return_value=[]),
+			patch.object(frappe.db, "sql", return_value=rows),
+		):
+			self.assertEqual(s3_utils._files_for_key(key), [])
+
+	def test_files_for_key_prefers_indexed_columns(self):
+		with (
+			patch.object(frappe.db, "sql_list", return_value=["FILE-1"]),
+			patch.object(frappe.db, "sql") as fallback,
+		):
+			self.assertEqual(s3_utils._files_for_key("private/uid/f.pdf"), ["FILE-1"])
+		fallback.assert_not_called()
+
+	# --- guest (web form) uploads ------------------------------------------
+
+	def test_guest_may_read_own_upload_when_enabled(self):
+		settings = frappe._dict(allow_guest_downloads=1, guest_upload_doctypes="")
+		file_doc = frappe._dict(owner="Guest", attached_to_doctype="Job Applicant")
+
+		with self._as_user("Guest"):
+			self.assertTrue(s3_utils._guest_may_read(file_doc, settings))
+
+	def test_guest_may_read_is_off_by_default(self):
+		settings = frappe._dict(allow_guest_downloads=0, guest_upload_doctypes="")
+		file_doc = frappe._dict(owner="Guest", attached_to_doctype="Job Applicant")
+
+		with self._as_user("Guest"):
+			self.assertFalse(s3_utils._guest_may_read(file_doc, settings))
+
+	def test_guest_may_not_read_someone_elses_file(self):
+		# The rule only ever covers what the visitor uploaded themselves.
+		settings = frappe._dict(allow_guest_downloads=1, guest_upload_doctypes="")
+		file_doc = frappe._dict(owner="Administrator", attached_to_doctype="Sales Invoice")
+
+		with self._as_user("Guest"):
+			self.assertFalse(s3_utils._guest_may_read(file_doc, settings))
+
+	def test_guest_rule_never_applies_to_a_logged_in_user(self):
+		settings = frappe._dict(allow_guest_downloads=1, guest_upload_doctypes="")
+		file_doc = frappe._dict(owner="Guest", attached_to_doctype="")
+
+		with self._as_user("test@example.com"):
+			self.assertFalse(s3_utils._guest_may_read(file_doc, settings))
+
+	def test_guest_doctype_allowlist_is_enforced(self):
+		settings = frappe._dict(allow_guest_downloads=1, guest_upload_doctypes="Job Applicant\n Lead ")
+
+		with self._as_user("Guest"):
+			self.assertTrue(
+				s3_utils._guest_may_read(frappe._dict(owner="Guest", attached_to_doctype="Lead"), settings)
+			)
+			self.assertFalse(
+				s3_utils._guest_may_read(
+					frappe._dict(owner="Guest", attached_to_doctype="Sales Invoice"), settings
+				)
+			)
+			# Not attached yet: the state of every upload before the form is submitted,
+			# which is exactly the preview this rule exists for.
+			self.assertTrue(
+				s3_utils._guest_may_read(frappe._dict(owner="Guest", attached_to_doctype=""), settings)
+			)
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_download_serves_guest_upload_when_enabled(self, mock_get_client):
+		frappe.db.set_single_value("S3 Settings", "allow_guest_downloads", 1)
+		s3 = MagicMock()
+		s3.generate_presigned_url.return_value = "https://signed.example/webform"
+		mock_get_client.return_value = s3
+
+		# Frappe grants a Guest no read permission on a private File.
+		file_doc = frappe._dict(owner="Guest", attached_to_doctype="", has_permission=lambda ptype: False)
+
+		with (
+			patch.object(s3_utils, "_files_for_key", return_value=["FILE-1"]),
+			self._file_doc(file_doc),
+			self._as_user("Guest"),
+		):
+			s3_utils.download_file("private/uid/cv.pdf")
+
+		self.assertEqual(frappe.local.response["location"], "https://signed.example/webform")
+
+	def test_download_refuses_guest_upload_when_disabled(self):
+		file_doc = frappe._dict(owner="Guest", attached_to_doctype="", has_permission=lambda ptype: False)
+
+		with (
+			patch.object(s3_utils, "_files_for_key", return_value=["FILE-1"]),
+			self._file_doc(file_doc),
+			self._as_user("Guest"),
+			self.assertRaises(frappe.PermissionError),
+		):
+			s3_utils.download_file("private/uid/cv.pdf")
 
 	# --- is_private change -------------------------------------------------
 

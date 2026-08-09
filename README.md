@@ -163,6 +163,13 @@ Open **S3 Settings** (a single doctype, System Manager only) and fill it in.
 > a presigned download would fail until the object is restored. These tiers only
 > make sense for cold data such as backups.
 
+#### Guest Access
+
+| Field | Default | Description |
+| --- | --- | --- |
+| **Allow Guests to Download Their Own Uploads** | Off | Lets an anonymous visitor open a **private** object when the File record is owned by `Guest` — the Web Form attachment case (see §4). Off by default. |
+| **Guest Readable Doctypes** | empty | Optional allowlist, one doctype per line. Restricts the rule above to guest uploads attached to those doctypes. Empty means any guest upload. |
+
 #### Test Connection
 
 After saving, click **Test Connection**. It runs a `HeadBucket` call and reports
@@ -206,6 +213,35 @@ delete commits, only when no other File still references it (deduplicated upload
 share one object), and a delete that fails is queued in **S3 Deletion Queue** and
 retried hourly so nothing is orphaned. Objects uploaded inside a transaction that
 rolls back are cleaned up automatically.
+
+#### Guest uploads on Web Forms
+
+A visitor who attaches a file to a Web Form uploads it as a **private** File owned
+by `Guest`. Frappe grants a Guest no read permission on a private File, so the
+attachment cannot be shown back to the visitor — neither in the preview right
+after upload nor on the submitted document. The result is a broken image or a
+`403` on a form that otherwise worked.
+
+Turning on **Allow Guests to Download Their Own Uploads** closes exactly that gap:
+
+- Only objects whose File record has `owner = "Guest"` qualify, i.e. only what a
+  visitor uploaded themselves — never another user's private file.
+- A file not attached to anything yet always passes: that is the state of every
+  upload between the file being sent and the form being submitted, which is the
+  preview the rule exists for.
+- Fill in **Guest Readable Doctypes** with the Web Form's doctype to narrow the
+  rule to that form's attachments once they are attached.
+
+The object stays private in the bucket and is still served through a short-lived
+presigned URL; what protects it from other visitors is the `uuid4` in its key —
+exactly the protection a `public/` object already relies on. ⚠️ **If the form
+collects sensitive documents (IDs, official papers), leave the checkbox off** and
+show the attachment to logged-in users only.
+
+The rule is applied at *serve* time, so files uploaded before it was enabled work
+too: no object is moved and no `file_url` changes — which matters, because that
+URL is stored inside the document's own Attach field and rewriting it would break
+every existing link.
 
 ### 5. Attachments that deliberately stay on local disk
 
