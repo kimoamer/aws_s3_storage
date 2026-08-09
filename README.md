@@ -209,10 +209,26 @@ the old object after commit — a file marked private is no longer reachable und
 public key.
 
 **Deletions are safe and durable.** An object is removed only after the File
-delete commits, only when no other File still references it (deduplicated uploads
-share one object), and a delete that fails is queued in **S3 Deletion Queue** and
-retried hourly so nothing is orphaned. Objects uploaded inside a transaction that
-rolls back are cleaned up automatically.
+delete commits, only when nothing still references it, and a delete that fails is
+queued in **S3 Deletion Queue** and retried hourly so nothing is orphaned. Objects
+uploaded inside a transaction that rolls back are cleaned up automatically.
+
+"Nothing still references it" is checked in three steps, cheapest first: another
+File's `s3_key`, another File's URL, and finally the **Attach fields of every
+doctype**. That last step matters because an Attach field stores the URL itself,
+and the value travels between documents (`fetch_from`, an Amend, a script copying
+a Job Applicant's CV onto the Interview). The File it came from can be deleted
+along with its own document while other documents still show the attachment —
+without the scan the object would go with it and every one of those links would
+die, with nothing in the bucket to restore. A field that cannot be scanned counts
+as a reference: keeping an unused object is always cheaper than deleting a live
+one. The field list is cached, and the scan is only reached for a real deletion
+whose key no File record covers any more.
+
+The one deletion that ignores document links is the old object left behind by a
+**privacy change**: there the object is superseded by a copy of itself under the
+other prefix, and it has to go, or a file just marked private stays readable under
+its public key.
 
 #### Guest uploads on Web Forms
 

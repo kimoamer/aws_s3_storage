@@ -595,12 +595,14 @@ def delete_file_from_s3(doc, only_thumbnail=False):
 			doc.delete_file_from_filesystem(only_thumbnail=only_thumbnail)
 		return
 
-	_delete_after_commit(get_bucket(), keys, check_references=True)
+	# check_documents: a real deletion is the one case where an Attach field still
+	# holding the URL has to win, because nothing would bring the object back.
+	_delete_after_commit(get_bucket(), keys, check_references=True, check_documents=True)
 
 
-def _delete_after_commit(bucket, keys, check_references=False):
+def _delete_after_commit(bucket, keys, check_references=False, check_documents=False):
 	def _run():
-		_delete_keys(bucket, keys, check_references=check_references)
+		_delete_keys(bucket, keys, check_references=check_references, check_documents=check_documents)
 
 	frappe.db.after_commit.add(_run)
 
@@ -612,11 +614,11 @@ def _delete_on_rollback(bucket, keys):
 	frappe.db.after_rollback.add(_run)
 
 
-def _delete_keys(bucket, keys, check_references=False):
+def _delete_keys(bucket, keys, check_references=False, check_documents=False):
 	s3 = get_s3_client()
 	for key in keys:
 		# Never delete an object another File still points at (dedup / shared use).
-		if check_references and _key_is_referenced(key):
+		if check_references and _key_is_referenced(key, check_documents=check_documents):
 			continue
 		try:
 			s3.delete_object(Bucket=bucket, Key=key)
@@ -625,8 +627,8 @@ def _delete_keys(bucket, keys, check_references=False):
 			_queue_deletion(bucket, key, str(e))
 
 
-def _key_is_referenced(key):
-	"""True when any File record still points at this object.
+def _key_is_referenced(key, check_documents=False):
+	"""True when anything still points at this object.
 
 	Deduplicated uploads share one object, and so does every Amend of a document:
 	the copied attachment is a new File record on the original's key. Removing the
@@ -635,6 +637,12 @@ def _key_is_referenced(key):
 	The key columns only cover records written through this app's File lifecycle;
 	one written directly (db_set, SQL) carries the key in its URL alone, so the URLs
 	are checked as well before anything is deleted.
+
+	``check_documents`` additionally scans the Attach fields of every doctype (see
+	_key_is_linked_from_a_document). It is on for a real deletion and deliberately
+	off when an object is being superseded by a copy of itself under the other
+	privacy prefix: there the old object *must* go, or a file just marked private
+	stays readable under its public key.
 	"""
 	if frappe.db.exists("File", {"s3_key": key}) or frappe.db.exists("File", {"s3_thumbnail_key": key}):
 		return True
@@ -649,10 +657,104 @@ def _key_is_referenced(key):
 	)
 	# The LIKE only narrows the scan (a file name may itself hold SQL wildcards);
 	# each candidate is decoded and compared properly below.
-	return any(
+	if any(
 		_url_references_key(file_url, key) or _url_references_key(thumbnail_url, key)
 		for file_url, thumbnail_url in rows
+	):
+		return True
+
+	return check_documents and _key_is_linked_from_a_document(key)
+
+
+def _key_is_linked_from_a_document(key):
+	"""True when a document's Attach field still holds this object's URL.
+
+	A File record is not the only thing pointing at an object: an Attach field
+	stores the URL itself, and that value travels between documents (``fetch_from``,
+	an Amend, a script carrying a Job Applicant's CV onto the Interview). The File
+	it came from can then be deleted — together with its own document — while other
+	documents still show the attachment. Without this check the object goes with it
+	and every one of those links dies, with nothing in the bucket to restore.
+
+	Only reached for a genuine deletion whose key no File record covers any more, so
+	the scan is rare; it stops at the first live reference, and the field list is
+	cached. A field that cannot be scanned counts as a reference: keeping an object
+	nothing uses any more is always cheaper than deleting a live one.
+	"""
+	pattern = f"%{_url_match_token(key)}%"
+	unscannable = False
+
+	for doctype, fieldname in _attach_fields():
+		try:
+			rows = frappe.db.sql(
+				f"""
+				SELECT `{fieldname}`
+				FROM `tab{doctype}`
+				WHERE `{fieldname}` LIKE %(pattern)s
+				LIMIT 20
+				""",
+				{"pattern": pattern},
+			)
+		except Exception:
+			# A field can outlive its column (renamed doctype, half-applied migration).
+			unscannable = True
+			continue
+
+		if any(_url_references_key(value, key) for (value,) in rows):
+			return True
+
+	return unscannable
+
+
+# Cached because _key_is_linked_from_a_document runs on the delete path, where the
+# doctype metadata behind this list changes far more slowly than files are removed.
+_ATTACH_FIELDS_CACHE_KEY = "aws_s3_storage:attach_fields"
+_ATTACH_FIELDS_CACHE_TTL = 3600
+
+
+def _attach_fields():
+	"""Every stored Attach / Attach Image field, as ``(doctype, fieldname)`` pairs.
+
+	Single and virtual doctypes have no row to attach to, and a child table's rows
+	are not what an attachment links to, so all three are left out.
+	"""
+	try:
+		return frappe.cache().get_value(
+			_ATTACH_FIELDS_CACHE_KEY,
+			generator=_query_attach_fields,
+			expires_in_sec=_ATTACH_FIELDS_CACHE_TTL,
+		)
+	except Exception:
+		return _query_attach_fields()
+
+
+def _query_attach_fields():
+	rows = frappe.db.sql(
+		"""
+		SELECT df.parent AS doctype, df.fieldname AS fieldname
+		FROM `tabDocField` df
+		JOIN `tabDocType` dt ON dt.name = df.parent
+		WHERE df.fieldtype IN ('Attach', 'Attach Image')
+		  AND dt.issingle = 0 AND dt.istable = 0 AND dt.is_virtual = 0
+		UNION
+		SELECT cf.dt AS doctype, cf.fieldname AS fieldname
+		FROM `tabCustom Field` cf
+		JOIN `tabDocType` dt ON dt.name = cf.dt
+		WHERE cf.fieldtype IN ('Attach', 'Attach Image')
+		  AND dt.issingle = 0 AND dt.istable = 0 AND dt.is_virtual = 0
+		""",
+		as_dict=True,
 	)
+
+	fields = []
+	for row in rows:
+		try:
+			if frappe.db.has_column(row.doctype, row.fieldname):
+				fields.append((row.doctype, row.fieldname))
+		except Exception:
+			continue
+
+	return fields
 
 
 def _url_match_token(key):

@@ -542,6 +542,73 @@ class TestS3Settings(FrappeTestCase):
 			s3_utils._delete_keys("test-bucket", ["public/uid/f.png"], check_references=True)
 		s3.delete_object.assert_called_once_with(Bucket="test-bucket", Key="public/uid/f.png")
 
+	# --- deletion guard: documents that still link the object ---------------
+
+	@contextmanager
+	def _document_links(self, values, unscannable=False):
+		"""One Attach field whose rows hold ``values``."""
+
+		def fake_sql(query, params=None):
+			if unscannable:
+				raise Exception("Unknown column")
+			return [(value,) for value in values]
+
+		with (
+			patch.object(
+				s3_utils, "_attach_fields", return_value=[("Interview", "custom_resume_attachment")]
+			),
+			patch.object(frappe.db, "sql", side_effect=fake_sql),
+		):
+			yield
+
+	def test_key_still_linked_from_a_document_is_referenced(self):
+		# The Job Applicant's File is gone, but the Interview still shows the CV.
+		key = "private/uid/cv.pdf"
+		with self._document_links([s3_utils._build_file_url(key)]):
+			self.assertTrue(s3_utils._key_is_linked_from_a_document(key))
+
+	def test_document_link_to_a_different_object_is_not_a_reference(self):
+		# Same uuid folder (the thumbnail lives there too) — only the LIKE matches.
+		with self._document_links([s3_utils._build_file_url("private/uid/other.pdf")]):
+			self.assertFalse(s3_utils._key_is_linked_from_a_document("private/uid/cv.pdf"))
+
+	def test_unscannable_field_counts_as_a_reference(self):
+		# Never delete on a check that could not be completed.
+		with self._document_links([], unscannable=True):
+			self.assertTrue(s3_utils._key_is_linked_from_a_document("private/uid/cv.pdf"))
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_delete_skips_key_a_document_still_links(self, mock_get_client):
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+		key = "private/uid/cv.pdf"
+
+		with (
+			patch.object(frappe.db, "exists", return_value=False),
+			patch.object(s3_utils, "_key_is_linked_from_a_document", return_value=True) as scan,
+		):
+			s3_utils._delete_keys("test-bucket", [key], check_references=True, check_documents=True)
+
+		scan.assert_called_once_with(key)
+		s3.delete_object.assert_not_called()
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_privacy_move_deletes_the_old_object_despite_a_document_link(self, mock_get_client):
+		# The old public object must go even while a document still shows its URL,
+		# otherwise a file just marked private stays readable under its public key.
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+
+		with (
+			patch.object(frappe.db, "exists", return_value=False),
+			patch.object(frappe.db, "sql", return_value=[]),
+			patch.object(s3_utils, "_key_is_linked_from_a_document") as scan,
+		):
+			s3_utils._delete_keys("test-bucket", ["public/uid/f.pdf"], check_references=True)
+
+		scan.assert_not_called()
+		s3.delete_object.assert_called_once_with(Bucket="test-bucket", Key="public/uid/f.pdf")
+
 	@patch.object(s3_utils, "get_s3_client")
 	def test_failed_delete_is_queued_for_retry(self, mock_get_client):
 		s3 = MagicMock()
@@ -793,7 +860,9 @@ class TestS3Settings(FrappeTestCase):
 		from aws_s3_storage.patches.v1_0 import restore_missing_file_records as repair
 
 		with (
-			patch.object(repair, "_attach_fields", return_value=[("Interview", "custom_resume_attachment")]),
+			patch.object(
+				s3_utils, "_attach_fields", return_value=[("Interview", "custom_resume_attachment")]
+			),
 			patch.object(repair, "_linked_rows", return_value=rows),
 			patch.object(s3_utils, "_files_for_key", return_value=list(covered_by)),
 			patch.object(s3_utils, "object_exists", return_value=object_exists),

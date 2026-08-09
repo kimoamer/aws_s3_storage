@@ -44,7 +44,7 @@ def execute():
 	bucket = _Bucket(settings)
 	restored, orphaned, failed = 0, [], []
 
-	for doctype, fieldname in _attach_fields():
+	for doctype, fieldname in s3_utils._attach_fields():
 		for row in _linked_rows(doctype, fieldname):
 			key = s3_utils._extract_key(row.value)
 			if not key or not key.startswith(s3_utils.SERVABLE_PREFIXES):
@@ -101,42 +101,6 @@ def _restore_file(doctype, fieldname, row, key):
 	# Commit per record: one document that refuses the insert (an attachment limit,
 	# a mandatory validation on its own doctype) must not discard the rest of the run.
 	frappe.db.commit()
-
-
-def _attach_fields():
-	"""Every stored Attach / Attach Image field, as ``(doctype, fieldname)`` pairs.
-
-	Single and virtual doctypes have no row to attach to, and a child table's rows
-	are not what ``attached_to_name`` refers to, so all three are left out.
-	"""
-	rows = frappe.db.sql(
-		"""
-		SELECT df.parent AS doctype, df.fieldname AS fieldname
-		FROM `tabDocField` df
-		JOIN `tabDocType` dt ON dt.name = df.parent
-		WHERE df.fieldtype IN ('Attach', 'Attach Image')
-		  AND dt.issingle = 0 AND dt.istable = 0 AND dt.is_virtual = 0
-		UNION
-		SELECT cf.dt AS doctype, cf.fieldname AS fieldname
-		FROM `tabCustom Field` cf
-		JOIN `tabDocType` dt ON dt.name = cf.dt
-		WHERE cf.fieldtype IN ('Attach', 'Attach Image')
-		  AND dt.issingle = 0 AND dt.istable = 0 AND dt.is_virtual = 0
-		""",
-		as_dict=True,
-	)
-
-	fields = []
-	for row in rows:
-		# A field can outlive its column (renamed doctype, failed migration); querying
-		# it would raise "Unknown column" and abort the whole patch.
-		try:
-			if frappe.db.has_column(row.doctype, row.fieldname):
-				fields.append((row.doctype, row.fieldname))
-		except Exception:
-			continue
-
-	return fields
 
 
 def _linked_rows(doctype, fieldname):
