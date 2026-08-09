@@ -17,6 +17,7 @@ class S3File(File):
 	moving remote files when privacy changes, and can't detect S3 objects for
 	deduplication. Each of those is routed through boto3 instead.
 	"""
+
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
 
@@ -147,27 +148,23 @@ class S3File(File):
 		# on v15.80, in before_insert() on newer builds). This is especially important
 		# when copying attachments during Amend, where an encoded %2B can otherwise
 		# become a raw '+'.
-		existing_key = (
-			s3_utils._extract_key(self.file_url)
-			or self.get("s3_key")
+		existing_key = s3_utils._extract_key(self.file_url) or self.get("s3_key")
+
+		existing_thumbnail_key = s3_utils._extract_key(self.get("thumbnail_url")) or self.get(
+			"s3_thumbnail_key"
 		)
-	
-		existing_thumbnail_key = (
-			s3_utils._extract_key(self.get("thumbnail_url"))
-			or self.get("s3_thumbnail_key")
-		)
-	
+
 		super().before_insert()
-	
+
 		# Rebuild canonical encoded URLs after Frappe has processed the copied File.
 		if existing_key:
 			self.s3_key = existing_key
 			self.file_url = s3_utils._build_file_url(existing_key)
-	
+
 		if existing_thumbnail_key:
 			self.s3_thumbnail_key = existing_thumbnail_key
 			self.thumbnail_url = s3_utils._build_file_url(existing_thumbnail_key)
-	
+
 		self._backfill_s3_keys()
 
 	def _backfill_s3_keys(self):
