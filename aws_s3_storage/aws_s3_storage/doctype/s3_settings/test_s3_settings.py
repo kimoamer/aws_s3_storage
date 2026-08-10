@@ -864,6 +864,7 @@ class TestS3Settings(FrappeTestCase):
 				s3_utils, "_attach_fields", return_value=[("Interview", "custom_resume_attachment")]
 			),
 			patch.object(repair, "_linked_rows", return_value=rows),
+			patch.object(repair, "_linked_single_values", return_value=[]),
 			patch.object(s3_utils, "_files_for_key", return_value=list(covered_by)),
 			patch.object(s3_utils, "object_exists", return_value=object_exists),
 			patch.object(s3_utils, "get_s3_client", return_value=MagicMock()),
@@ -903,6 +904,45 @@ class TestS3Settings(FrappeTestCase):
 		with self._linked_rows(rows, object_exists=False) as restore:
 			repair.execute()
 		restore.assert_not_called()
+
+	def test_patch_restores_a_logo_attached_to_a_single(self):
+		# The site logo and favicon live in Website Settings, whose values are rows in
+		# tabSingles, not columns on a table — and they are requested on every page.
+		from aws_s3_storage.patches.v1_0 import restore_missing_file_records as repair
+
+		key = "private/0fed92f26b0a4df991df01bc9cfe8421/PL-logo-favicon.png"
+		single = frappe._dict(
+			doctype="Website Settings", field="favicon", value=s3_utils._build_file_url(key)
+		)
+
+		with (
+			patch.object(s3_utils, "_attach_fields", return_value=[]),
+			patch.object(repair, "_linked_single_values", return_value=[single]),
+			patch.object(s3_utils, "_files_for_key", return_value=[]),
+			patch.object(s3_utils, "object_exists", return_value=True),
+			patch.object(s3_utils, "get_s3_client", return_value=MagicMock()),
+			patch.object(repair, "_restore_file") as restore,
+		):
+			repair.execute()
+
+		doctype, fieldname, row, restored_key = restore.call_args[0]
+		self.assertEqual((doctype, fieldname), ("Website Settings", "favicon"))
+		# A Single's record is the doctype itself.
+		self.assertEqual(row.name, "Website Settings")
+		self.assertEqual(restored_key, key)
+
+	def test_deletion_guard_sees_a_link_held_by_a_single(self):
+		key = "private/0fed92f26b0a4df991df01bc9cfe8421/PL-logo-favicon.png"
+
+		def fake_sql(query, params=None):
+			# Only tabSingles holds it; no table-backed field does.
+			return [(s3_utils._build_file_url(key),)] if "tabSingles" in query else []
+
+		with (
+			patch.object(s3_utils, "_attach_fields", return_value=[]),
+			patch.object(frappe.db, "sql", side_effect=fake_sql),
+		):
+			self.assertTrue(s3_utils._key_is_linked_from_a_document(key))
 
 	def test_patch_ignores_local_and_non_servable_values(self):
 		from aws_s3_storage.patches.v1_0 import restore_missing_file_records as repair

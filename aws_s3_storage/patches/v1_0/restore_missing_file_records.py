@@ -44,29 +44,28 @@ def execute():
 	bucket = _Bucket(settings)
 	restored, orphaned, failed = 0, [], []
 
-	for doctype, fieldname in s3_utils._attach_fields():
-		for row in _linked_rows(doctype, fieldname):
-			key = s3_utils._extract_key(row.value)
-			if not key or not key.startswith(s3_utils.SERVABLE_PREFIXES):
-				continue
+	for doctype, fieldname, row in _s3_links():
+		key = s3_utils._extract_key(row.value)
+		if not key or not key.startswith(s3_utils.SERVABLE_PREFIXES):
+			continue
 
-			if s3_utils._files_for_key(key):
-				# A File record still covers this object; permissions already resolve.
-				continue
+		if s3_utils._files_for_key(key):
+			# A File record still covers this object; permissions already resolve.
+			continue
 
-			where = f"{doctype} {row.name}.{fieldname}"
+		where = f"{doctype} {row.name}.{fieldname}"
 
-			if not s3_utils.object_exists(key, s3=bucket.s3, bucket=bucket.name):
-				# Nothing to point a record at — recreating one would only turn a 403
-				# into a 404. Report it so the field can be cleared or re-uploaded.
-				orphaned.append(f"{where}: object is not in the bucket ({key})")
-				continue
+		if not s3_utils.object_exists(key, s3=bucket.s3, bucket=bucket.name):
+			# Nothing to point a record at — recreating one would only turn a 403
+			# into a 404. Report it so the field can be cleared or re-uploaded.
+			orphaned.append(f"{where}: object is not in the bucket ({key})")
+			continue
 
-			try:
-				_restore_file(doctype, fieldname, row, key)
-				restored += 1
-			except Exception as e:
-				failed.append(f"{where}: {e}")
+		try:
+			_restore_file(doctype, fieldname, row, key)
+			restored += 1
+		except Exception as e:
+			failed.append(f"{where}: {e}")
 
 	if restored:
 		print(f"aws_s3_storage: restored {restored} missing File record(s)")
@@ -101,6 +100,43 @@ def _restore_file(doctype, fieldname, row, key):
 	# Commit per record: one document that refuses the insert (an attachment limit,
 	# a mandatory validation on its own doctype) must not discard the rest of the run.
 	frappe.db.commit()
+
+
+def _s3_links():
+	"""Yield ``(doctype, fieldname, row)`` for every field holding a download URL."""
+	for doctype, fieldname in s3_utils._attach_fields():
+		for row in _linked_rows(doctype, fieldname):
+			yield doctype, fieldname, row
+
+	for single in _linked_single_values():
+		# A Single's "record" is the doctype itself, which is what an attachment on it
+		# links to. Nothing records who set the value, so the File falls to Administrator.
+		yield (
+			single.doctype,
+			single.field,
+			frappe._dict(name=single.doctype, owner="Administrator", value=single.value),
+		)
+
+
+def _linked_single_values():
+	"""Attach values on Single doctypes — the site logo and favicon live here.
+
+	Every field of every Single is one row in `tabSingles`, so a single query covers
+	all of them; there is no per-doctype table to scan.
+	"""
+	try:
+		return frappe.db.sql(
+			"""
+			SELECT `doctype`, `field`, `value`
+			FROM `tabSingles`
+			WHERE `value` LIKE %(pattern)s
+			""",
+			{"pattern": f"%{s3_utils.DOWNLOAD_METHOD}%"},
+			as_dict=True,
+		)
+	except Exception as e:
+		print(f"aws_s3_storage: could not scan tabSingles: {e}")
+		return []
 
 
 def _linked_rows(doctype, fieldname):

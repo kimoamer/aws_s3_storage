@@ -684,6 +684,21 @@ def _key_is_linked_from_a_document(key):
 	pattern = f"%{_url_match_token(key)}%"
 	unscannable = False
 
+	# Single doctypes keep every field in one narrow table, so all of them — the site
+	# logo and favicon in Website Settings, a letter head's image, a print logo — are
+	# covered by this one cheap query. They are also the values most likely to outlive
+	# the File record they came from.
+	try:
+		rows = frappe.db.sql(
+			"SELECT `value` FROM `tabSingles` WHERE `value` LIKE %(pattern)s",
+			{"pattern": pattern},
+		)
+	except Exception:
+		unscannable = True
+	else:
+		if any(_url_references_key(value, key) for (value,) in rows):
+			return True
+
 	for doctype, fieldname in _attach_fields():
 		try:
 			rows = frappe.db.sql(
