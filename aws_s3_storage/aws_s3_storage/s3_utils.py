@@ -699,7 +699,15 @@ def _key_is_linked_from_a_document(key):
 		if any(_url_references_key(value, key) for (value,) in rows):
 			return True
 
-	for doctype, fieldname in _attach_fields():
+	try:
+		fields = _attach_fields()
+	except Exception:
+		# This runs inside an after_commit callback, where an escaping exception would
+		# surface on a request whose work is already committed. Fail closed instead:
+		# the object stays, and the deletion queue is not involved.
+		return True
+
+	for doctype, fieldname in fields:
 		try:
 			rows = frappe.db.sql(
 				f"""
