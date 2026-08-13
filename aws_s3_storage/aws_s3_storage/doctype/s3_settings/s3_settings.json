@@ -20,6 +20,9 @@
   "enable_backup_sync",
   "backup_storage_class",
   "delete_local_backup_after_sync",
+  "guest_access_section",
+  "allow_guest_downloads",
+  "guest_upload_doctypes",
   "migration_section",
   "enable_scheduled_migration",
   "daily_migration_limit",
@@ -123,6 +126,25 @@
    "label": "Delete Local Backup After Sync"
   },
   {
+   "fieldname": "guest_access_section",
+   "fieldtype": "Section Break",
+   "label": "Guest Access"
+  },
+  {
+   "default": "0",
+   "description": "Serve a private object to an anonymous visitor when the File record is owned by Guest (e.g. a Web Form attachment they just uploaded). The object stays private in the bucket and is served through a short-lived presigned URL.",
+   "fieldname": "allow_guest_downloads",
+   "fieldtype": "Check",
+   "label": "Allow Guests to Download Their Own Uploads"
+  },
+  {
+   "depends_on": "allow_guest_downloads",
+   "description": "Optional. One doctype per line: restricts the rule above to guest uploads attached to these doctypes. Leave empty to allow any guest upload.",
+   "fieldname": "guest_upload_doctypes",
+   "fieldtype": "Small Text",
+   "label": "Guest Readable Doctypes"
+  },
+  {
    "fieldname": "migration_section",
    "fieldtype": "Section Break",
    "label": "Scheduled Migration"
@@ -155,7 +177,7 @@
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2026-07-22 00:00:00.000000",
+ "modified": "2026-08-09 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Aws S3 Storage",
  "name": "S3 Settings",

@@ -163,6 +163,13 @@ Open **S3 Settings** (a single doctype, System Manager only) and fill it in.
 > a presigned download would fail until the object is restored. These tiers only
 > make sense for cold data such as backups.
 
+#### Guest Access
+
+| Field | Default | Description |
+| --- | --- | --- |
+| **Allow Guests to Download Their Own Uploads** | Off | Lets an anonymous visitor open a **private** object when the File record is owned by `Guest` — the Web Form attachment case (see §4). Off by default. |
+| **Guest Readable Doctypes** | empty | Optional allowlist, one doctype per line. Restricts the rule above to guest uploads attached to those doctypes. Empty means any guest upload. |
+
 #### Test Connection
 
 After saving, click **Test Connection**. It runs a `HeadBucket` call and reports
@@ -202,10 +209,78 @@ the old object after commit — a file marked private is no longer reachable und
 public key.
 
 **Deletions are safe and durable.** An object is removed only after the File
-delete commits, only when no other File still references it (deduplicated uploads
-share one object), and a delete that fails is queued in **S3 Deletion Queue** and
-retried hourly so nothing is orphaned. Objects uploaded inside a transaction that
-rolls back are cleaned up automatically.
+delete commits, only when nothing still references it, and a delete that fails is
+queued in **S3 Deletion Queue** and retried hourly so nothing is orphaned. Objects
+uploaded inside a transaction that rolls back are cleaned up automatically.
+
+"Nothing still references it" is checked in three steps, cheapest first: another
+File's `s3_key`, another File's URL, and finally the **Attach fields of every
+doctype**. That last step matters because an Attach field stores the URL itself,
+and the value travels between documents (`fetch_from`, an Amend, a script copying
+a Job Applicant's CV onto the Interview). The File it came from can be deleted
+along with its own document while other documents still show the attachment —
+without the scan the object would go with it and every one of those links would
+die, with nothing in the bucket to restore. A field that cannot be scanned counts
+as a reference: keeping an unused object is always cheaper than deleting a live
+one. The field list is cached, and the scan is only reached for a real deletion
+whose key no File record covers any more.
+
+The one deletion that ignores document links is the old object left behind by a
+**privacy change**: there the object is superseded by a copy of itself under the
+other prefix, and it has to go, or a file just marked private stays readable under
+its public key.
+
+#### Guest uploads on Web Forms
+
+A visitor who attaches a file to a Web Form uploads it as a **private** File owned
+by `Guest`. Frappe grants a Guest no read permission on a private File, so the
+attachment cannot be shown back to the visitor — neither in the preview right
+after upload nor on the submitted document. The result is a broken image or a
+`403` on a form that otherwise worked.
+
+Turning on **Allow Guests to Download Their Own Uploads** closes exactly that gap:
+
+- Only objects whose File record has `owner = "Guest"` qualify, i.e. only what a
+  visitor uploaded themselves — never another user's private file.
+- A file not attached to anything yet always passes: that is the state of every
+  upload between the file being sent and the form being submitted, which is the
+  preview the rule exists for.
+- Fill in **Guest Readable Doctypes** with the Web Form's doctype to narrow the
+  rule to that form's attachments once they are attached.
+
+The object stays private in the bucket and is still served through a short-lived
+presigned URL; what protects it from other visitors is the `uuid4` in its key —
+exactly the protection a `public/` object already relies on. ⚠️ **If the form
+collects sensitive documents (IDs, official papers), leave the checkbox off** and
+show the attachment to logged-in users only.
+
+The rule is applied at *serve* time, so files uploaded before it was enabled work
+too: no object is moved and no `file_url` changes — which matters, because that
+URL is stored inside the document's own Attach field and rewriting it would break
+every existing link.
+
+#### When a link has no File record left
+
+The rule above needs a File record to reason about. An attachment can lose one —
+a Web Form upload whose File was never created, a value written into an Attach
+field with `db_set`/SQL, or a File deleted while another document still held its
+URL. The URL then 403s for **everyone**, not just for a Guest, because there is
+nothing left to check permission against.
+
+The `restore_missing_file_records` patch repairs that on `bench migrate`. It walks
+every stored Attach / Attach Image field and, for each S3 link with no File record:
+
+- recreates the record **attached to the document that references it**, so read
+  permission flows from that document like any normal attachment, or
+- prints the link when the object is gone from the bucket too — that one cannot be
+  repaired, the file has to be uploaded again.
+
+No object is written and no URL is rewritten; only the missing rows come back. It
+is idempotent, and can be re-run at any time:
+
+```bash
+bench --site <site> execute aws_s3_storage.patches.v1_0.restore_missing_file_records.execute
+```
 
 ### 5. Attachments that deliberately stay on local disk
 

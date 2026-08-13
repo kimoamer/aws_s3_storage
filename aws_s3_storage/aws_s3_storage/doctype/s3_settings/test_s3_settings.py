@@ -5,6 +5,7 @@ import base64
 import hashlib
 import os
 import tempfile
+from contextlib import contextmanager
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 
@@ -24,6 +25,32 @@ class TestS3Settings(FrappeTestCase):
 		frappe.db.set_single_value("S3 Settings", "verify_upload_integrity", 0)
 		frappe.db.set_single_value("S3 Settings", "presigned_url_expiry", 3600)
 		frappe.db.set_single_value("S3 Settings", "enable_backup_sync", 0)
+		frappe.db.set_single_value("S3 Settings", "allow_guest_downloads", 0)
+		frappe.db.set_single_value("S3 Settings", "guest_upload_doctypes", "")
+
+	# --- helpers -----------------------------------------------------------
+
+	@contextmanager
+	def _as_user(self, user):
+		original = frappe.session.user
+		frappe.session.user = user
+		try:
+			yield
+		finally:
+			frappe.session.user = original
+
+	@contextmanager
+	def _file_doc(self, file_doc):
+		"""Fake only the File lookup: get_single("S3 Settings") goes through get_doc too."""
+		real_get_doc = frappe.get_doc
+
+		def fake_get_doc(*args, **kwargs):
+			if args and args[0] == "File":
+				return file_doc
+			return real_get_doc(*args, **kwargs)
+
+		with patch.object(frappe, "get_doc", side_effect=fake_get_doc):
+			yield
 
 	# --- URL / key helpers -------------------------------------------------
 
@@ -305,22 +332,156 @@ class TestS3Settings(FrappeTestCase):
 				s3_utils.download_file(bad)
 
 	@patch.object(s3_utils, "get_s3_client")
-	def test_download_private_checks_permission_via_thumbnail_key(self, mock_get_client):
+	def test_download_private_checks_read_permission(self, mock_get_client):
 		s3 = MagicMock()
 		s3.generate_presigned_url.return_value = "https://signed.example/thumb"
 		mock_get_client.return_value = s3
 
-		def fake_get_value(doctype, filters, fieldname):
-			return "FILE-1" if "s3_thumbnail_key" in filters else None
+		file_doc = frappe._dict(owner="Administrator", has_permission=lambda ptype: True)
 
 		with (
-			patch.object(frappe.db, "get_value", side_effect=fake_get_value),
-			patch.object(frappe, "get_doc") as mock_get_doc,
+			patch.object(s3_utils, "_files_for_key", return_value=["FILE-1"]),
+			self._file_doc(file_doc),
 		):
 			s3_utils.download_file("private/uid/pic_small.png")
 
-		mock_get_doc.assert_called_once_with("File", "FILE-1")
-		mock_get_doc.return_value.check_permission.assert_called_once_with("read")
+		self.assertEqual(frappe.local.response["location"], "https://signed.example/thumb")
+
+	def test_download_private_refuses_without_read_permission(self):
+		file_doc = frappe._dict(owner="Administrator", has_permission=lambda ptype: False)
+
+		with (
+			patch.object(s3_utils, "_files_for_key", return_value=["FILE-1"]),
+			self._file_doc(file_doc),
+			self.assertRaises(frappe.PermissionError),
+		):
+			s3_utils.download_file("private/uid/secret.pdf")
+
+	def test_download_private_refuses_unknown_key(self):
+		with (
+			patch.object(s3_utils, "_files_for_key", return_value=[]),
+			self.assertRaises(frappe.PermissionError),
+		):
+			s3_utils.download_file("private/uid/not-a-record.pdf")
+
+	# --- legacy records without the s3_key column --------------------------
+
+	def test_files_for_key_falls_back_to_url_match(self):
+		# Uploaded before s3_key existed: the key lives only inside file_url, so the
+		# exact-column lookup finds nothing and the record must still resolve.
+		key = "private/uid123/report.pdf"
+		rows = [frappe._dict(name="FILE-1", file_url=s3_utils._build_file_url(key), thumbnail_url=None)]
+
+		with (
+			patch.object(frappe.db, "sql_list", return_value=[]),
+			patch.object(frappe.db, "sql", return_value=rows),
+		):
+			self.assertEqual(s3_utils._files_for_key(key), ["FILE-1"])
+
+	def test_files_for_key_drops_rows_the_like_only_narrowed(self):
+		# The LIKE matches on the uuid alone; a different object under the same uuid
+		# (e.g. its thumbnail's sibling) must not count as this key.
+		key = "private/uid123/report.pdf"
+		rows = [
+			frappe._dict(
+				name="FILE-2",
+				file_url=s3_utils._build_file_url("private/uid123/other.pdf"),
+				thumbnail_url=None,
+			)
+		]
+
+		with (
+			patch.object(frappe.db, "sql_list", return_value=[]),
+			patch.object(frappe.db, "sql", return_value=rows),
+		):
+			self.assertEqual(s3_utils._files_for_key(key), [])
+
+	def test_files_for_key_prefers_indexed_columns(self):
+		with (
+			patch.object(frappe.db, "sql_list", return_value=["FILE-1"]),
+			patch.object(frappe.db, "sql") as fallback,
+		):
+			self.assertEqual(s3_utils._files_for_key("private/uid/f.pdf"), ["FILE-1"])
+		fallback.assert_not_called()
+
+	# --- guest (web form) uploads ------------------------------------------
+
+	def test_guest_may_read_own_upload_when_enabled(self):
+		settings = frappe._dict(allow_guest_downloads=1, guest_upload_doctypes="")
+		file_doc = frappe._dict(owner="Guest", attached_to_doctype="Job Applicant")
+
+		with self._as_user("Guest"):
+			self.assertTrue(s3_utils._guest_may_read(file_doc, settings))
+
+	def test_guest_may_read_is_off_by_default(self):
+		settings = frappe._dict(allow_guest_downloads=0, guest_upload_doctypes="")
+		file_doc = frappe._dict(owner="Guest", attached_to_doctype="Job Applicant")
+
+		with self._as_user("Guest"):
+			self.assertFalse(s3_utils._guest_may_read(file_doc, settings))
+
+	def test_guest_may_not_read_someone_elses_file(self):
+		# The rule only ever covers what the visitor uploaded themselves.
+		settings = frappe._dict(allow_guest_downloads=1, guest_upload_doctypes="")
+		file_doc = frappe._dict(owner="Administrator", attached_to_doctype="Sales Invoice")
+
+		with self._as_user("Guest"):
+			self.assertFalse(s3_utils._guest_may_read(file_doc, settings))
+
+	def test_guest_rule_never_applies_to_a_logged_in_user(self):
+		settings = frappe._dict(allow_guest_downloads=1, guest_upload_doctypes="")
+		file_doc = frappe._dict(owner="Guest", attached_to_doctype="")
+
+		with self._as_user("test@example.com"):
+			self.assertFalse(s3_utils._guest_may_read(file_doc, settings))
+
+	def test_guest_doctype_allowlist_is_enforced(self):
+		settings = frappe._dict(allow_guest_downloads=1, guest_upload_doctypes="Job Applicant\n Lead ")
+
+		with self._as_user("Guest"):
+			self.assertTrue(
+				s3_utils._guest_may_read(frappe._dict(owner="Guest", attached_to_doctype="Lead"), settings)
+			)
+			self.assertFalse(
+				s3_utils._guest_may_read(
+					frappe._dict(owner="Guest", attached_to_doctype="Sales Invoice"), settings
+				)
+			)
+			# Not attached yet: the state of every upload before the form is submitted,
+			# which is exactly the preview this rule exists for.
+			self.assertTrue(
+				s3_utils._guest_may_read(frappe._dict(owner="Guest", attached_to_doctype=""), settings)
+			)
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_download_serves_guest_upload_when_enabled(self, mock_get_client):
+		frappe.db.set_single_value("S3 Settings", "allow_guest_downloads", 1)
+		s3 = MagicMock()
+		s3.generate_presigned_url.return_value = "https://signed.example/webform"
+		mock_get_client.return_value = s3
+
+		# Frappe grants a Guest no read permission on a private File.
+		file_doc = frappe._dict(owner="Guest", attached_to_doctype="", has_permission=lambda ptype: False)
+
+		with (
+			patch.object(s3_utils, "_files_for_key", return_value=["FILE-1"]),
+			self._file_doc(file_doc),
+			self._as_user("Guest"),
+		):
+			s3_utils.download_file("private/uid/cv.pdf")
+
+		self.assertEqual(frappe.local.response["location"], "https://signed.example/webform")
+
+	def test_download_refuses_guest_upload_when_disabled(self):
+		file_doc = frappe._dict(owner="Guest", attached_to_doctype="", has_permission=lambda ptype: False)
+
+		with (
+			patch.object(s3_utils, "_files_for_key", return_value=["FILE-1"]),
+			self._file_doc(file_doc),
+			self._as_user("Guest"),
+			self.assertRaises(frappe.PermissionError),
+		):
+			s3_utils.download_file("private/uid/cv.pdf")
 
 	# --- is_private change -------------------------------------------------
 
@@ -380,6 +541,73 @@ class TestS3Settings(FrappeTestCase):
 		with patch.object(frappe.db, "exists", return_value=False):
 			s3_utils._delete_keys("test-bucket", ["public/uid/f.png"], check_references=True)
 		s3.delete_object.assert_called_once_with(Bucket="test-bucket", Key="public/uid/f.png")
+
+	# --- deletion guard: documents that still link the object ---------------
+
+	@contextmanager
+	def _document_links(self, values, unscannable=False):
+		"""One Attach field whose rows hold ``values``."""
+
+		def fake_sql(query, params=None):
+			if unscannable:
+				raise Exception("Unknown column")
+			return [(value,) for value in values]
+
+		with (
+			patch.object(
+				s3_utils, "_attach_fields", return_value=[("Interview", "custom_resume_attachment")]
+			),
+			patch.object(frappe.db, "sql", side_effect=fake_sql),
+		):
+			yield
+
+	def test_key_still_linked_from_a_document_is_referenced(self):
+		# The Job Applicant's File is gone, but the Interview still shows the CV.
+		key = "private/uid/cv.pdf"
+		with self._document_links([s3_utils._build_file_url(key)]):
+			self.assertTrue(s3_utils._key_is_linked_from_a_document(key))
+
+	def test_document_link_to_a_different_object_is_not_a_reference(self):
+		# Same uuid folder (the thumbnail lives there too) — only the LIKE matches.
+		with self._document_links([s3_utils._build_file_url("private/uid/other.pdf")]):
+			self.assertFalse(s3_utils._key_is_linked_from_a_document("private/uid/cv.pdf"))
+
+	def test_unscannable_field_counts_as_a_reference(self):
+		# Never delete on a check that could not be completed.
+		with self._document_links([], unscannable=True):
+			self.assertTrue(s3_utils._key_is_linked_from_a_document("private/uid/cv.pdf"))
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_delete_skips_key_a_document_still_links(self, mock_get_client):
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+		key = "private/uid/cv.pdf"
+
+		with (
+			patch.object(frappe.db, "exists", return_value=False),
+			patch.object(s3_utils, "_key_is_linked_from_a_document", return_value=True) as scan,
+		):
+			s3_utils._delete_keys("test-bucket", [key], check_references=True, check_documents=True)
+
+		scan.assert_called_once_with(key)
+		s3.delete_object.assert_not_called()
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_privacy_move_deletes_the_old_object_despite_a_document_link(self, mock_get_client):
+		# The old public object must go even while a document still shows its URL,
+		# otherwise a file just marked private stays readable under its public key.
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+
+		with (
+			patch.object(frappe.db, "exists", return_value=False),
+			patch.object(frappe.db, "sql", return_value=[]),
+			patch.object(s3_utils, "_key_is_linked_from_a_document") as scan,
+		):
+			s3_utils._delete_keys("test-bucket", ["public/uid/f.pdf"], check_references=True)
+
+		scan.assert_not_called()
+		s3.delete_object.assert_called_once_with(Bucket="test-bucket", Key="public/uid/f.pdf")
 
 	@patch.object(s3_utils, "get_s3_client")
 	def test_failed_delete_is_queued_for_retry(self, mock_get_client):
@@ -623,6 +851,109 @@ class TestS3Settings(FrappeTestCase):
 		finally:
 			if os.path.exists(tmp.name):
 				os.unlink(tmp.name)
+
+	# --- restoring File records a document still links to -------------------
+
+	@contextmanager
+	def _linked_rows(self, rows, covered_by=(), object_exists=True):
+		"""Run the patch over ``rows`` of one Attach field, faking every lookup."""
+		from aws_s3_storage.patches.v1_0 import restore_missing_file_records as repair
+
+		with (
+			patch.object(
+				s3_utils, "_attach_fields", return_value=[("Interview", "custom_resume_attachment")]
+			),
+			patch.object(repair, "_linked_rows", return_value=rows),
+			patch.object(repair, "_linked_single_values", return_value=[]),
+			patch.object(s3_utils, "_files_for_key", return_value=list(covered_by)),
+			patch.object(s3_utils, "object_exists", return_value=object_exists),
+			patch.object(s3_utils, "get_s3_client", return_value=MagicMock()),
+			patch.object(repair, "_restore_file") as restore,
+		):
+			yield restore
+
+	def _interview_row(self, key):
+		return frappe._dict(name="HR-INT-0001", owner="hr@example.com", value=s3_utils._build_file_url(key))
+
+	def test_patch_restores_record_for_orphaned_link(self):
+		from aws_s3_storage.patches.v1_0 import restore_missing_file_records as repair
+
+		key = "private/f5288607fbaa4ac4948da25797a7868c/Eslam_S_Cv_.pdf"
+		with self._linked_rows([self._interview_row(key)]) as restore:
+			repair.execute()
+
+		restore.assert_called_once()
+		doctype, fieldname, row, restored_key = restore.call_args[0]
+		self.assertEqual((doctype, fieldname), ("Interview", "custom_resume_attachment"))
+		self.assertEqual(restored_key, key)
+		self.assertEqual(row.name, "HR-INT-0001")
+
+	def test_patch_skips_link_already_covered_by_a_file_record(self):
+		from aws_s3_storage.patches.v1_0 import restore_missing_file_records as repair
+
+		rows = [self._interview_row("private/uid/cv.pdf")]
+		with self._linked_rows(rows, covered_by=["FILE-1"]) as restore:
+			repair.execute()
+		restore.assert_not_called()
+
+	def test_patch_reports_instead_of_restoring_a_deleted_object(self):
+		# Recreating a record for an object that is gone only turns a 403 into a 404.
+		from aws_s3_storage.patches.v1_0 import restore_missing_file_records as repair
+
+		rows = [self._interview_row("private/uid/cv.pdf")]
+		with self._linked_rows(rows, object_exists=False) as restore:
+			repair.execute()
+		restore.assert_not_called()
+
+	def test_patch_restores_a_logo_attached_to_a_single(self):
+		# The site logo and favicon live in Website Settings, whose values are rows in
+		# tabSingles, not columns on a table — and they are requested on every page.
+		from aws_s3_storage.patches.v1_0 import restore_missing_file_records as repair
+
+		key = "private/0fed92f26b0a4df991df01bc9cfe8421/PL-logo-favicon.png"
+		single = frappe._dict(
+			doctype="Website Settings", field="favicon", value=s3_utils._build_file_url(key)
+		)
+
+		with (
+			patch.object(s3_utils, "_attach_fields", return_value=[]),
+			patch.object(repair, "_linked_single_values", return_value=[single]),
+			patch.object(s3_utils, "_files_for_key", return_value=[]),
+			patch.object(s3_utils, "object_exists", return_value=True),
+			patch.object(s3_utils, "get_s3_client", return_value=MagicMock()),
+			patch.object(repair, "_restore_file") as restore,
+		):
+			repair.execute()
+
+		doctype, fieldname, row, restored_key = restore.call_args[0]
+		self.assertEqual((doctype, fieldname), ("Website Settings", "favicon"))
+		# A Single's record is the doctype itself.
+		self.assertEqual(row.name, "Website Settings")
+		self.assertEqual(restored_key, key)
+
+	def test_deletion_guard_sees_a_link_held_by_a_single(self):
+		key = "private/0fed92f26b0a4df991df01bc9cfe8421/PL-logo-favicon.png"
+
+		def fake_sql(query, params=None):
+			# Only tabSingles holds it; no table-backed field does.
+			return [(s3_utils._build_file_url(key),)] if "tabSingles" in query else []
+
+		with (
+			patch.object(s3_utils, "_attach_fields", return_value=[]),
+			patch.object(frappe.db, "sql", side_effect=fake_sql),
+		):
+			self.assertTrue(s3_utils._key_is_linked_from_a_document(key))
+
+	def test_patch_ignores_local_and_non_servable_values(self):
+		from aws_s3_storage.patches.v1_0 import restore_missing_file_records as repair
+
+		rows = [
+			frappe._dict(name="D1", owner="x", value="/files/local.pdf"),
+			frappe._dict(name="D2", owner="x", value=s3_utils._build_file_url("backups/site/db.sql.gz")),
+		]
+		with self._linked_rows(rows) as restore:
+			repair.execute()
+		restore.assert_not_called()
 
 	# --- backup sync -------------------------------------------------------
 

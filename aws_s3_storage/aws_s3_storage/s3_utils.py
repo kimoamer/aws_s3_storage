@@ -423,69 +423,136 @@ def move_object_privacy(file_doc):
 # ---------------------------------------------------------------------------
 
 
+def _files_for_key(key):
+	"""Names of every File record pointing at this object.
+
+	The indexed key columns are tried first. Records written before those columns
+	existed (or written directly with db_set / SQL) carry the key only inside their
+	URL, so fall back to the same URL matching used by the deletion guard —
+	otherwise a perfectly valid old attachment resolves to no record at all and is
+	refused even for a user who may read it.
+	"""
+	names = frappe.db.sql_list(
+		"""
+		SELECT `name`
+		FROM `tabFile`
+		WHERE `s3_key` = %(key)s
+		   OR `s3_thumbnail_key` = %(key)s
+		""",
+		{"key": key},
+	)
+	if names:
+		return names
+
+	rows = frappe.db.sql(
+		"""
+		SELECT `name`, `file_url`, `thumbnail_url`
+		FROM `tabFile`
+		WHERE `file_url` LIKE %(pattern)s OR `thumbnail_url` LIKE %(pattern)s
+		""",
+		{"pattern": f"%{_url_match_token(key)}%"},
+		as_dict=True,
+	)
+	return [
+		row.name
+		for row in rows
+		if _url_references_key(row.file_url, key) or _url_references_key(row.thumbnail_url, key)
+	]
+
+
+def _guest_may_read(file_doc, settings):
+	"""Whether the anonymous visitor may read this private object.
+
+	Frappe never grants a Guest read access to a private File (see
+	frappe/core/doctype/file/file.py:has_permission and download_private_file), so a
+	web form attachment uploaded by a visitor cannot be shown back to them — not in
+	the preview right after upload, and not on the submitted document.
+
+	This opt-in rule closes that gap without widening access for anyone else:
+	only objects whose File record is *owned by Guest* qualify, i.e. only what a
+	visitor uploaded themselves. The object stays private in the bucket and is still
+	served through a short-lived presigned URL; what protects it from other visitors
+	is the uuid4 in its key, exactly as it protects a public/ object today.
+	"""
+	if frappe.session.user != "Guest":
+		return False
+
+	if not cint(settings.get("allow_guest_downloads")):
+		return False
+
+	if (file_doc.get("owner") or "") != "Guest":
+		return False
+
+	allowed = {
+		doctype.strip()
+		for doctype in (settings.get("guest_upload_doctypes") or "").splitlines()
+		if doctype.strip()
+	}
+	attached_to = file_doc.get("attached_to_doctype") or ""
+
+	# An empty allowlist means "any guest upload". A file that is not attached to
+	# anything yet is always allowed through: that is the state of every upload
+	# between the file being sent and the web form being submitted, which is exactly
+	# the preview this rule exists for.
+	if allowed and attached_to and attached_to not in allowed:
+		return False
+
+	return True
+
+
 @frappe.whitelist(allow_guest=True)
 def download_file(key=None):
-    """Serve an S3 file while preserving literal '+' characters in its key."""
+	"""Serve an S3 file while preserving literal '+' characters in its key."""
 
-    raw_query = ""
+	raw_query = ""
 
-    if frappe.request:
-        raw_query = frappe.request.query_string or b""
+	if frappe.request:
+		raw_query = frappe.request.query_string or b""
 
-        if isinstance(raw_query, bytes):
-            raw_query = raw_query.decode("utf-8", errors="replace")
+		if isinstance(raw_query, bytes):
+			raw_query = raw_query.decode("utf-8", errors="replace")
 
-    raw_key = _extract_key(f"/?{raw_query}") if raw_query else None
+	raw_key = _extract_key(f"/?{raw_query}") if raw_query else None
 
-    key = raw_key or _normalize_key(key)
+	key = raw_key or _normalize_key(key)
 
-    if not key or not key.startswith(SERVABLE_PREFIXES):
-        raise frappe.PermissionError
+	if not key or not key.startswith(SERVABLE_PREFIXES):
+		raise frappe.PermissionError
 
-    settings = frappe.get_single("S3 Settings")
+	settings = frappe.get_single("S3 Settings")
 
-    if key.startswith("private/"):
-        file_names = frappe.db.sql_list(
-            """
-            SELECT `name`
-            FROM `tabFile`
-            WHERE `s3_key` = %(key)s
-               OR `s3_thumbnail_key` = %(key)s
-            """,
-            {"key": key},
-        )
+	if key.startswith("private/"):
+		file_names = _files_for_key(key)
 
-        if not file_names:
-            raise frappe.PermissionError
+		if not file_names:
+			raise frappe.PermissionError
 
-        has_access = False
+		has_access = False
 
-        for file_name in file_names:
-            file_doc = frappe.get_doc("File", file_name)
+		for file_name in file_names:
+			file_doc = frappe.get_doc("File", file_name)
 
-            if file_doc.has_permission("read"):
-                has_access = True
-                break
+			if file_doc.has_permission("read") or _guest_may_read(file_doc, settings):
+				has_access = True
+				break
 
-        if not has_access:
-            raise frappe.PermissionError
+		if not has_access:
+			raise frappe.PermissionError
 
-    s3 = get_s3_client()
+	s3 = get_s3_client()
 
-    presigned_url = s3.generate_presigned_url(
-        "get_object",
-        Params={
-            "Bucket": settings.bucket_name,
-            "Key": key,
-            "ResponseContentDisposition": _content_disposition(
-                key.rsplit("/", 1)[-1]
-            ),
-        },
-        ExpiresIn=_presigned_expiry(settings),
-    )
+	presigned_url = s3.generate_presigned_url(
+		"get_object",
+		Params={
+			"Bucket": settings.bucket_name,
+			"Key": key,
+			"ResponseContentDisposition": _content_disposition(key.rsplit("/", 1)[-1]),
+		},
+		ExpiresIn=_presigned_expiry(settings),
+	)
 
-    frappe.local.response["type"] = "redirect"
-    frappe.local.response["location"] = presigned_url
+	frappe.local.response["type"] = "redirect"
+	frappe.local.response["location"] = presigned_url
 
 
 @frappe.whitelist()
@@ -528,12 +595,14 @@ def delete_file_from_s3(doc, only_thumbnail=False):
 			doc.delete_file_from_filesystem(only_thumbnail=only_thumbnail)
 		return
 
-	_delete_after_commit(get_bucket(), keys, check_references=True)
+	# check_documents: a real deletion is the one case where an Attach field still
+	# holding the URL has to win, because nothing would bring the object back.
+	_delete_after_commit(get_bucket(), keys, check_references=True, check_documents=True)
 
 
-def _delete_after_commit(bucket, keys, check_references=False):
+def _delete_after_commit(bucket, keys, check_references=False, check_documents=False):
 	def _run():
-		_delete_keys(bucket, keys, check_references=check_references)
+		_delete_keys(bucket, keys, check_references=check_references, check_documents=check_documents)
 
 	frappe.db.after_commit.add(_run)
 
@@ -545,11 +614,11 @@ def _delete_on_rollback(bucket, keys):
 	frappe.db.after_rollback.add(_run)
 
 
-def _delete_keys(bucket, keys, check_references=False):
+def _delete_keys(bucket, keys, check_references=False, check_documents=False):
 	s3 = get_s3_client()
 	for key in keys:
 		# Never delete an object another File still points at (dedup / shared use).
-		if check_references and _key_is_referenced(key):
+		if check_references and _key_is_referenced(key, check_documents=check_documents):
 			continue
 		try:
 			s3.delete_object(Bucket=bucket, Key=key)
@@ -558,8 +627,8 @@ def _delete_keys(bucket, keys, check_references=False):
 			_queue_deletion(bucket, key, str(e))
 
 
-def _key_is_referenced(key):
-	"""True when any File record still points at this object.
+def _key_is_referenced(key, check_documents=False):
+	"""True when anything still points at this object.
 
 	Deduplicated uploads share one object, and so does every Amend of a document:
 	the copied attachment is a new File record on the original's key. Removing the
@@ -568,6 +637,12 @@ def _key_is_referenced(key):
 	The key columns only cover records written through this app's File lifecycle;
 	one written directly (db_set, SQL) carries the key in its URL alone, so the URLs
 	are checked as well before anything is deleted.
+
+	``check_documents`` additionally scans the Attach fields of every doctype (see
+	_key_is_linked_from_a_document). It is on for a real deletion and deliberately
+	off when an object is being superseded by a copy of itself under the other
+	privacy prefix: there the old object *must* go, or a file just marked private
+	stays readable under its public key.
 	"""
 	if frappe.db.exists("File", {"s3_key": key}) or frappe.db.exists("File", {"s3_thumbnail_key": key}):
 		return True
@@ -582,10 +657,127 @@ def _key_is_referenced(key):
 	)
 	# The LIKE only narrows the scan (a file name may itself hold SQL wildcards);
 	# each candidate is decoded and compared properly below.
-	return any(
+	if any(
 		_url_references_key(file_url, key) or _url_references_key(thumbnail_url, key)
 		for file_url, thumbnail_url in rows
+	):
+		return True
+
+	return check_documents and _key_is_linked_from_a_document(key)
+
+
+def _key_is_linked_from_a_document(key):
+	"""True when a document's Attach field still holds this object's URL.
+
+	A File record is not the only thing pointing at an object: an Attach field
+	stores the URL itself, and that value travels between documents (``fetch_from``,
+	an Amend, a script carrying a Job Applicant's CV onto the Interview). The File
+	it came from can then be deleted — together with its own document — while other
+	documents still show the attachment. Without this check the object goes with it
+	and every one of those links dies, with nothing in the bucket to restore.
+
+	Only reached for a genuine deletion whose key no File record covers any more, so
+	the scan is rare; it stops at the first live reference, and the field list is
+	cached. A field that cannot be scanned counts as a reference: keeping an object
+	nothing uses any more is always cheaper than deleting a live one.
+	"""
+	pattern = f"%{_url_match_token(key)}%"
+	unscannable = False
+
+	# Single doctypes keep every field in one narrow table, so all of them — the site
+	# logo and favicon in Website Settings, a letter head's image, a print logo — are
+	# covered by this one cheap query. They are also the values most likely to outlive
+	# the File record they came from.
+	try:
+		rows = frappe.db.sql(
+			"SELECT `value` FROM `tabSingles` WHERE `value` LIKE %(pattern)s",
+			{"pattern": pattern},
+		)
+	except Exception:
+		unscannable = True
+	else:
+		if any(_url_references_key(value, key) for (value,) in rows):
+			return True
+
+	try:
+		fields = _attach_fields()
+	except Exception:
+		# This runs inside an after_commit callback, where an escaping exception would
+		# surface on a request whose work is already committed. Fail closed instead:
+		# the object stays, and the deletion queue is not involved.
+		return True
+
+	for doctype, fieldname in fields:
+		try:
+			rows = frappe.db.sql(
+				f"""
+				SELECT `{fieldname}`
+				FROM `tab{doctype}`
+				WHERE `{fieldname}` LIKE %(pattern)s
+				LIMIT 20
+				""",
+				{"pattern": pattern},
+			)
+		except Exception:
+			# A field can outlive its column (renamed doctype, half-applied migration).
+			unscannable = True
+			continue
+
+		if any(_url_references_key(value, key) for (value,) in rows):
+			return True
+
+	return unscannable
+
+
+# Cached because _key_is_linked_from_a_document runs on the delete path, where the
+# doctype metadata behind this list changes far more slowly than files are removed.
+_ATTACH_FIELDS_CACHE_KEY = "aws_s3_storage:attach_fields"
+_ATTACH_FIELDS_CACHE_TTL = 3600
+
+
+def _attach_fields():
+	"""Every stored Attach / Attach Image field, as ``(doctype, fieldname)`` pairs.
+
+	Single and virtual doctypes have no row to attach to, and a child table's rows
+	are not what an attachment links to, so all three are left out.
+	"""
+	try:
+		return frappe.cache().get_value(
+			_ATTACH_FIELDS_CACHE_KEY,
+			generator=_query_attach_fields,
+			expires_in_sec=_ATTACH_FIELDS_CACHE_TTL,
+		)
+	except Exception:
+		return _query_attach_fields()
+
+
+def _query_attach_fields():
+	rows = frappe.db.sql(
+		"""
+		SELECT df.parent AS doctype, df.fieldname AS fieldname
+		FROM `tabDocField` df
+		JOIN `tabDocType` dt ON dt.name = df.parent
+		WHERE df.fieldtype IN ('Attach', 'Attach Image')
+		  AND dt.issingle = 0 AND dt.istable = 0 AND dt.is_virtual = 0
+		UNION
+		SELECT cf.dt AS doctype, cf.fieldname AS fieldname
+		FROM `tabCustom Field` cf
+		JOIN `tabDocType` dt ON dt.name = cf.dt
+		WHERE cf.fieldtype IN ('Attach', 'Attach Image')
+		  AND dt.issingle = 0 AND dt.istable = 0 AND dt.is_virtual = 0
+		""",
+		as_dict=True,
 	)
+
+	fields = []
+	for row in rows:
+		try:
+			if frappe.db.has_column(row.doctype, row.fieldname):
+				fields.append((row.doctype, row.fieldname))
+		except Exception:
+			continue
+
+	return fields
 
 
 def _url_match_token(key):
