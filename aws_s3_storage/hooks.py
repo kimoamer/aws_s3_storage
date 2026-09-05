@@ -136,13 +136,16 @@ override_doctype_class = {"File": "aws_s3_storage.aws_s3_storage.file_override.S
 # ---------------
 # Hook on document methods and events
 
-# doc_events = {
-# 	"*": {
-# 		"on_update": "method",
-# 		"on_cancel": "method",
-# 		"on_trash": "method"
-# 	}
-# }
+# A file's doctype scope can only be read from the document it is attached to, and
+# that link can arrive (or change) long after the upload — a Web Form attachment, an
+# attachment re-attached or copied onto another doctype. This re-checks it on save
+# and moves the file to the storage it now belongs on. No-op unless "Limit S3
+# Storage to Specific Doctypes" is on.
+doc_events = {
+	"File": {
+		"on_update": "aws_s3_storage.aws_s3_storage.migrate.reevaluate_scope",
+	}
+}
 
 # Scheduled Tasks
 # ---------------

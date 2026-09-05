@@ -328,6 +328,21 @@ def in_scope(file_doc=None, settings=None, attached_to_doctype=None):
 	return doctype in scoped_doctypes(settings)
 
 
+def should_store_in_s3(file_doc=None, fname=None, settings=None):
+	"""Where this file belongs: True for S3, False for Frappe's local storage.
+
+	The single answer used by the upload hook, by the deduplication guard in
+	S3File, and whenever an attachment is re-attached to another doctype — so all
+	three can never disagree about one file.
+	"""
+	settings = settings if settings is not None else frappe.get_single("S3 Settings")
+	if not _is_enabled(settings) or not settings.bucket_name:
+		return False
+	if is_local_only_file(file_doc, fname):
+		return False
+	return in_scope(file_doc, settings)
+
+
 def scope_description(settings=None):
 	"""One-line summary of the scope, for the admin UI."""
 	settings = settings if settings is not None else frappe.get_single("S3 Settings")
@@ -360,16 +375,11 @@ def write_file_to_s3(file_or_fname, content=None, content_type=None, is_private=
 	file_doc = file_or_fname if isinstance(file_or_fname, Document) else None
 	fname = file_doc.file_name if file_doc is not None else file_or_fname
 
-	# Master switch: when disabled — or before a bucket is configured — fall back to
-	# Frappe's default local storage instead of failing the upload. Attachments that
-	# an app rewrites in place by path (see is_local_only_file), and doctypes outside
-	# the configured scope (see in_scope), take the same route.
-	if (
-		not _is_enabled(settings)
-		or not settings.bucket_name
-		or is_local_only_file(file_doc, fname)
-		or not in_scope(file_doc, settings)
-	):
+	# Everything that does not belong in S3 — the master switch off, no bucket yet,
+	# an attachment an app rewrites in place by path, a doctype outside the
+	# configured scope — falls back to Frappe's default local storage instead of
+	# failing the upload.
+	if not should_store_in_s3(file_doc, fname, settings):
 		return _save_to_filesystem(file_or_fname, content, content_type, is_private)
 
 	if file_doc is not None:
@@ -633,15 +643,51 @@ def download_file(key=None):
 def test_connection():
 	"""Verify the configured credentials can reach the bucket.
 
-	Wired to the 'Test Connection' button on the S3 Settings form.
+	Wired to the 'Test Connection' button on the S3 Settings form. Also reports
+	whether the bucket keeps versions, because that is what decides whether a
+	deletion in Frappe is recoverable (see the README, "Protecting the bucket from
+	deletion") — the app deletes objects when their File record is deleted, and
+	without versioning that is permanent.
 	"""
 	frappe.only_for("System Manager")
 	settings = frappe.get_single("S3 Settings")
+	s3 = get_s3_client()
 	try:
-		get_s3_client().head_bucket(Bucket=settings.bucket_name)
+		s3.head_bucket(Bucket=settings.bucket_name)
 	except Exception as e:
 		frappe.throw(f"Could not connect to bucket '{settings.bucket_name}': {e}")
-	return f"Successfully connected to bucket '{settings.bucket_name}'."
+
+	message = f"Successfully connected to bucket '{settings.bucket_name}'."
+	return f"{message}<br><br>{bucket_versioning_note(settings, s3)}"
+
+
+def bucket_versioning_note(settings=None, s3=None):
+	"""One line on the bucket's versioning state, for the Test Connection dialog."""
+	settings = settings if settings is not None else frappe.get_single("S3 Settings")
+	try:
+		status = (s3 or get_s3_client()).get_bucket_versioning(Bucket=settings.bucket_name).get("Status")
+	except Exception as e:
+		# get_bucket_versioning is not in the README's minimal IAM policy, and
+		# S3-compatible services may not implement it at all. Not knowing is not a
+		# connection failure — say so and move on.
+		return (
+			"<b>Versioning:</b> could not be checked "
+			f"({e.__class__.__name__}). Add <code>s3:GetBucketVersioning</code> to the "
+			"IAM policy, or check it in the S3 console."
+		)
+
+	if status == "Enabled":
+		return "<b>Versioning: enabled.</b> A file deleted in Frappe can be restored from the bucket."
+	if status == "Suspended":
+		return (
+			"<b>Versioning: suspended.</b> Existing versions are kept, but new deletions "
+			"are permanent. Re-enable it on the bucket."
+		)
+	return (
+		"<b>Versioning: OFF.</b> Deleting a File in Frappe permanently deletes the object "
+		"in S3 — there is nothing to restore from. Enable Bucket Versioning "
+		"(see the README, section 8)."
+	)
 
 
 # ---------------------------------------------------------------------------

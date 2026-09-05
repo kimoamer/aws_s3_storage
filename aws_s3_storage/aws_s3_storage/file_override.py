@@ -166,6 +166,48 @@ class S3File(File):
 			self.thumbnail_url = s3_utils._build_file_url(existing_thumbnail_key)
 
 		self._backfill_s3_keys()
+		self._enforce_storage_location()
+
+	def _enforce_storage_location(self):
+		"""Undo a content-hash reuse that would store this file in the wrong place.
+
+		Frappe deduplicates twice while inserting a File — once in ``save_file()``
+		and again in ``validate_duplicate_entry()`` — and both simply copy the
+		matching record's ``file_url``, wherever that record happens to live. With a
+		doctype scope configured that silently breaks it in both directions: an
+		out-of-scope attachment inherits an S3 object, and an in-scope one is left on
+		local disk because an identical file was uploaded before the bucket existed.
+		Neither reuse is visible anywhere — the record simply ends up on the wrong
+		storage forever.
+
+		So after Frappe is done, compare where the file *is* with where it belongs
+		and, when they disagree, write the content again with deduplication turned
+		off. Nothing was written in the reuse case, so this is the file's only write.
+
+		Copies that carry no content of their own (an Amend re-inserting an
+		attachment, a record built straight from a URL) are left alone: there is
+		nothing to write, and the object they point at belongs to the record they
+		were copied from.
+		"""
+		if self.get("is_folder") or self.flags.get("copy_from_existing_file"):
+			return
+
+		# _content is the decoded payload; preferring it avoids decoding twice.
+		content = getattr(self, "_content", None) or self.get("content")
+		if not content:
+			return
+
+		if s3_utils.should_store_in_s3(self) == bool(self._key()):
+			return
+
+		self.file_url = None
+		self.s3_key = None
+		self.s3_thumbnail_key = None
+		# save_file() checks is_remote_file on its first line, and with no URL that
+		# reads self.content — set it, or the rewrite would silently do nothing.
+		self.content = content
+		self.save_file(content=content, ignore_existing_file_check=True)
+		self._backfill_s3_keys()
 
 	def _backfill_s3_keys(self):
 		if not self.get("s3_key"):

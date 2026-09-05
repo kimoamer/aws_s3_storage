@@ -86,6 +86,7 @@ Why each action is needed:
 | `s3:DeleteObject` | `/*` | Removing objects when a File is deleted. |
 | `s3:ListBucket` | bucket | `HeadBucket`, used by the **Test Connection** button. |
 | `s3:GetBucketLocation` | bucket | boto3 resolves the bucket's region with this call; without it some setups fail with `AccessDenied`. |
+| `s3:GetBucketVersioning` | bucket | Optional. Lets **Test Connection** report whether deletions are recoverable (§8). Without it everything still works; the dialog just says it could not check. |
 
 #### 1.3 Create an IAM user and access keys
 
@@ -186,6 +187,11 @@ Open **S3 Settings** (a single doctype, System Manager only) and fill it in.
 
 After saving, click **Test Connection**. It runs a `HeadBucket` call and reports
 whether the credentials, region, and bucket name are correct.
+
+It also reports whether the bucket keeps **versions** — the one setting that
+decides whether a file deleted in Frappe can be brought back (§8). If versioning
+is off, the dialog says so; if the IAM user cannot read it, add
+`s3:GetBucketVersioning` to the policy (§1.2) or check it in the S3 console.
 
 ### 3. Backup sync
 
@@ -458,14 +464,43 @@ frappe.db.sql("""
 | --- | --- | --- |
 | New uploads | Stored in S3 | Stored on local disk (Frappe's default) — the same fallback the master switch uses |
 | Migration (manual **and** daily) | Migrated | Never touched; not counted as pending |
-| Files already in S3 | Served / moved / deleted as usual | **Also served / moved / deleted as usual** |
+| Attached, or re-attached, later | Moved **into** S3 | Moved **back to local disk** |
+| Duplicate of a file stored elsewhere | Written to S3 anyway | Written to disk anyway |
+| Files already in S3, doctype still in scope | Served / moved / deleted as usual | — |
 | Backups (§3) | — | Unaffected: backups are not File records and have their own switch |
 
-The scope only decides **where a new object is written**. Narrowing it later
-never orphans anything: objects already in the bucket keep being served through
-presigned URLs, follow a privacy change between the `public/` and `private/`
-prefixes, and are removed when their File record is deleted, exactly as before.
-Nothing moves back to local disk on its own.
+**A file follows its document.** The scope can only be read from the document an
+attachment hangs off, and that link is not always there when the file is written:
+a Web Form uploads its attachment *before* the document exists, and an attachment
+can be re-attached — or copied by an Amend — onto a different doctype much later.
+So the decision is re-made every time a File record is saved, and the file moves
+to where it now belongs:
+
+- **into S3** when its doctype enters the scope (this is what makes the Web Form
+  case work: the upload starts local, then moves once the form is submitted), and
+- **back to local disk** when it lands on a doctype the scope excludes — the
+  object is downloaded, written to the site's files folder, the record and the
+  document field are repointed, and the object is deleted **only if no other File
+  record or Attach field still uses it**. An object shared with an in-scope
+  record stays in the bucket for that record.
+
+The move runs as a background job after the save commits, so it never slows down
+(or fails) the save that triggered it. It is a no-op unless the scope is
+restricted, and re-checks everything when it runs, so it is safe to repeat.
+
+**Deduplication follows the scope too.** Frappe reuses an existing file whenever
+the content hash matches, before the storage hook runs — which would put an
+out-of-scope attachment on an S3 object, or leave an in-scope one on local disk
+because an identical file was uploaded before the bucket existed. Both are
+corrected: when a reused file is on the wrong storage, the content is written
+again where it belongs. Identical files stored in the *same* place still
+deduplicate normally.
+
+Narrowing the scope later never orphans anything: objects already in the bucket
+keep being served through presigned URLs, follow a privacy change between the
+`public/` and `private/` prefixes, and are removed when their File record is
+deleted, exactly as before. Existing files do **not** move on their own — only a
+record that is saved again is re-evaluated.
 
 **Migration Status** shows the active scope, and its *Pending* count is the
 number of files inside it — so you can widen the list and watch the count grow
@@ -478,18 +513,40 @@ Notes and edge cases:
 - Restricting the scope with **no** doctype listed and the unattached switch off
   means nothing is stored in S3 at all; the settings form warns you when you save
   it. A doctype name that does not exist (a typo) gets the same warning.
-- Frappe deduplicates uploads by content hash *before* the storage hook runs. If
-  an out-of-scope upload is byte-identical to a file already in S3, Frappe reuses
-  that record's URL, so the new attachment points at the existing object too. It
-  is served normally, and the object is protected from deletion while either
-  record still references it (§4).
-- Print formats, letter heads, site logo, Web Form uploads before submission and
-  anything uploaded straight from the File list are *unattached* — they follow
-  **Include Files Not Attached to a Document**, not the doctype list.
+- Print formats, letter heads, site logo and anything uploaded straight from the
+  File list are *unattached* — they follow **Include Files Not Attached to a
+  Document**, not the doctype list. A Web Form upload is unattached only until
+  the form is submitted; after that it follows the doctype it was attached to.
+- **Delete Verified Local Copies** (§6) only ever walks records that already
+  carry an S3 key, and it keeps any local file another File record still points
+  at. A file the scope keeps on disk has no S3 key, so it is never a candidate —
+  the button cannot delete it. What it does clean up is the local copy of a file
+  that *is* in S3, including one migrated before the scope was narrowed; that
+  copy is redundant, and each one is removed only after its object is verified
+  present with a matching size.
 - **Audit Local Links** (§6) stays site-wide on purpose: it reports every field
   that still contains a `/files/` link, whatever doctype the file itself belongs
   to. With a restricted scope many of those are simply files that are meant to
   stay on disk.
+- Moving a file back to disk downloads the object into memory. That is fine for
+  ordinary attachments; if you are about to re-attach something very large to an
+  out-of-scope doctype, expect one download per file.
+
+**Turning it on (the setting is off by default).** Installing this app — or this
+branch — changes nothing on its own: storage stays site-wide until you tick the
+box. A safe rollout:
+
+1. Enable **Bucket Versioning** first (§8.2) — everything below deletes and moves
+   objects, and versioning is what makes any of it reversible.
+2. Run the query above and decide the list of doctypes.
+3. Tick **Limit S3 Storage to Specific Doctypes**, fill the list, decide the
+   unattached switch, save. Check the warning if one appears.
+4. Open **Migration Status** and confirm the **Scope** line and the **Pending**
+   count are what you expect *before* starting a migration.
+5. Upload one attachment on an in-scope doctype and one on an out-of-scope
+   doctype, and check where each landed (the File record's hidden **S3 Key**
+   field is set only for the S3 one).
+6. Then run the migration (§6).
 
 ### 8. Protecting the bucket from deletion (versioning, backup, Object Lock)
 
@@ -506,6 +563,7 @@ AWS layer, where nothing inside Frappe can undo it.
 | --- | --- |
 | A **File record is deleted** — from the File list, by a user deleting a document (attachments cascade), by a script, `frappe.delete_doc`, a bulk delete | `DeleteObject` **after the transaction commits**, and only if no other File record and no document's Attach field still holds that key (§4). A rolled-back delete removes nothing. |
 | **Privacy changes** (public ↔ private) | The object is copied to the other prefix and the old key is deleted after commit (unless something still references it). |
+| An attachment moves to a doctype **outside** the S3 scope (§7) | The object is downloaded to local disk, the record repointed, and the object deleted after commit — again only if nothing else references it. |
 | A delete that **fails** (permissions, network) | The key is queued in **S3 Deletion Queue** and retried hourly, up to 10 attempts, then marked `Failed` and left alone. |
 | **Migration step 3** / *Delete Local After Migration* | Deletes **local copies only** — never an S3 object. |
 | **Backup sync** (§3) | Never deletes anything in S3 (only the local backup file, if you enable that). |

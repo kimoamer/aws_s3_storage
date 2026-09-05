@@ -26,6 +26,7 @@ attachments of the listed doctypes, and the pending count reflects that.
 
 import mimetypes
 import os
+import re
 import time
 
 import frappe
@@ -512,6 +513,152 @@ def _update_attached_field(doc, old_url, new_url):
 	except Exception:
 		frappe.logger().exception(f"S3 migration: failed to update linked field for File {doc.name}")
 		raise
+
+
+# ---------------------------------------------------------------------------
+# Moving a file back to local disk
+# ---------------------------------------------------------------------------
+
+
+def move_file_to_disk(row):
+	"""Bring one S3-backed File back to the site's files folder.
+
+	Used by the ``move_local_only_files_to_disk`` patch and whenever an attachment
+	moves to a doctype the S3 scope excludes. ``row`` is a File document or any
+	dict-like row carrying name / file_name / file_url / s3_key / is_private and
+	the ``attached_to_*`` fields.
+
+	The object is dropped only after commit **and** only if nothing else points at
+	it: an object shared with another File record — a deduplicated upload, an
+	attachment copied by an Amend — stays in the bucket for the records that still
+	use it, while this record becomes local.
+
+	Only the file itself moves. A generated thumbnail keeps its own S3 object and
+	key, so it is still served (and still removed with the record); it is a preview,
+	not the attachment.
+	"""
+	key = row.get("s3_key") or s3_utils._extract_key(row.get("file_url"))
+	content = s3_utils.read_file_from_s3(key)
+
+	file_name, file_url = _write_local_copy(row, content)
+	frappe.db.set_value(
+		"File",
+		row.name,
+		{"file_name": file_name, "file_url": file_url, "s3_key": None},
+		update_modified=False,
+	)
+	# The owning document still holds the S3 URL and is looked up by it — repoint
+	# it to the local one. row.file_url is still the old (S3) value here.
+	_update_attached_field(row, row.get("file_url"), file_url)
+
+	s3_utils._delete_after_commit(s3_utils.get_bucket(), [key], check_references=True)
+	return file_url
+
+
+def _write_local_copy(row, content):
+	folder = "private" if cint(row.get("is_private")) else "public"
+	prefix = "/private/files/" if folder == "private" else "/files/"
+	# Same sanitising Frappe applies in File.save_file_on_filesystem().
+	file_name = re.sub(r"[/\\%?#]", "_", os.path.basename(row.get("file_name") or "")) or row.name
+
+	if frappe.db.exists("File", {"file_url": prefix + file_name, "name": ["!=", row.name]}):
+		# Another record already owns that name on disk — don't overwrite its content.
+		stem, ext = os.path.splitext(file_name)
+		file_name = f"{stem}-{row.name}{ext}"
+
+	path = frappe.get_site_path(folder, "files", file_name)
+	os.makedirs(os.path.dirname(path), exist_ok=True)
+	with open(path, "wb") as f:
+		f.write(content)
+
+	return file_name, prefix + file_name
+
+
+# ---------------------------------------------------------------------------
+# Keeping a file on the storage its doctype asks for
+# ---------------------------------------------------------------------------
+# A file's scope can only be read from the document it is attached to, and that
+# link is not always there when the file is written: a Web Form uploads its
+# attachment before the document exists, and an attachment can be re-attached or
+# copied onto another doctype long afterwards. So the decision is re-made
+# whenever a File is saved, and the file follows it — into S3 once its doctype is
+# in scope, back to local disk when it moves to a doctype that is not.
+
+
+def reevaluate_scope(doc, method=None):
+	"""File ``on_update`` hook: queue a move when the file is on the wrong storage.
+
+	Only ever does something while the doctype scope is restricted — without it
+	nothing can be out of place. The move itself runs in a background job after
+	commit: it talks to S3, and must not slow down (or fail) the save that
+	triggered it.
+	"""
+	if doc.get("is_folder") or not doc.get("name"):
+		return
+
+	# Cheapest possible gate: this runs on every File save. get_single_value is
+	# cached, so the common (unrestricted) case costs one cache read.
+	if not cint(frappe.db.get_single_value("S3 Settings", "restrict_to_doctypes")):
+		return
+
+	settings = frappe.get_single("S3 Settings")
+	if not settings.bucket_name:
+		return
+
+	in_s3 = bool(doc.get("s3_key") or s3_utils._extract_key(doc.get("file_url")))
+	if in_s3 == s3_utils.should_store_in_s3(doc, settings=settings):
+		return
+
+	# Uploading is only possible from a file that is actually on this server; an
+	# external http(s) attachment has nothing to move.
+	if not in_s3 and not _is_local_url(doc.get("file_url")):
+		return
+
+	frappe.enqueue(
+		"aws_s3_storage.aws_s3_storage.migrate.move_file_for_scope",
+		queue="short",
+		enqueue_after_commit=True,
+		file_name=doc.name,
+	)
+
+
+def move_file_for_scope(file_name):
+	"""Background job: put one file on the storage its doctype scope asks for.
+
+	Re-checks everything: the job runs after commit, and the record may have
+	changed (or been deleted) again in the meantime.
+	"""
+	if not frappe.db.exists("File", file_name):
+		return
+
+	settings = frappe.get_single("S3 Settings")
+	if not s3_utils.is_scope_restricted(settings) or not settings.bucket_name:
+		return
+
+	doc = frappe.get_doc("File", file_name)
+	if doc.is_folder:
+		return
+
+	key = doc.get("s3_key") or s3_utils._extract_key(doc.file_url)
+	belongs_in_s3 = s3_utils.should_store_in_s3(doc, settings=settings)
+
+	if belongs_in_s3 and not key:
+		if not _is_local_url(doc.file_url):
+			return
+		result = migrate_file(
+			file_name,
+			delete_local=cint(settings.get("auto_delete_after_migration")),
+			settings=settings,
+		)
+		frappe.logger().info(f"S3 scope: {file_name} moved into S3 ({result})")
+	elif key and not belongs_in_s3:
+		move_file_to_disk(doc)
+		frappe.db.commit()
+		frappe.logger().info(f"S3 scope: {file_name} moved back to local disk")
+
+
+def _is_local_url(file_url):
+	return bool(file_url) and (file_url.startswith("/files/") or file_url.startswith("/private/files/"))
 
 
 # ---------------------------------------------------------------------------

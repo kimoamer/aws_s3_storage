@@ -17,11 +17,7 @@ it, then drop the now-unused object.
 Idempotent — a second run finds nothing left to move.
 """
 
-import os
-import re
-
 import frappe
-from frappe.utils import cint
 
 from aws_s3_storage.aws_s3_storage import migrate, s3_utils
 
@@ -38,7 +34,7 @@ def execute():
 	moved = failed = 0
 	for row in _s3_backed_local_only_files():
 		try:
-			_move_to_disk(row)
+			migrate.move_file_to_disk(row)
 			frappe.db.commit()
 			moved += 1
 		except Exception as e:
@@ -77,41 +73,3 @@ def _s3_backed_local_only_files():
 				rows[row.name] = row
 
 	return list(rows.values())
-
-
-def _move_to_disk(row):
-	key = row.s3_key or s3_utils._extract_key(row.file_url)
-	content = s3_utils.read_file_from_s3(key)
-
-	file_name, file_url = _write_local_copy(row, content)
-	frappe.db.set_value(
-		"File",
-		row.name,
-		{"file_name": file_name, "file_url": file_url, "s3_key": None},
-		update_modified=False,
-	)
-	# The owning document (e.g. Repost Item Valuation.reposting_data_file) still
-	# holds the S3 URL and is looked up by it — repoint it to the local one.
-	migrate._update_attached_field(row, row.file_url, file_url)
-
-	# Only after the record is safely local: the object is no longer referenced.
-	s3_utils._delete_after_commit(s3_utils.get_bucket(), [key], check_references=True)
-
-
-def _write_local_copy(row, content):
-	folder = "private" if cint(row.is_private) else "public"
-	prefix = "/private/files/" if folder == "private" else "/files/"
-	# Same sanitising Frappe applies in File.save_file_on_filesystem().
-	file_name = re.sub(r"[/\\%?#]", "_", os.path.basename(row.file_name or "")) or row.name
-
-	if frappe.db.exists("File", {"file_url": prefix + file_name, "name": ["!=", row.name]}):
-		# Another record already owns that name on disk — don't overwrite its content.
-		stem, ext = os.path.splitext(file_name)
-		file_name = f"{stem}-{row.name}{ext}"
-
-	path = frappe.get_site_path(folder, "files", file_name)
-	os.makedirs(os.path.dirname(path), exist_ok=True)
-	with open(path, "wb") as f:
-		f.write(content)
-
-	return file_name, prefix + file_name
