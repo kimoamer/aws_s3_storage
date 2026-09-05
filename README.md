@@ -4,6 +4,10 @@ AWS S3 integration for Frappe — stores uploaded files (and, optionally, site
 backups) in an S3 bucket instead of on the local disk. The bucket stays fully
 private and every file is served through short-lived presigned URLs.
 
+It can be limited to specific doctypes instead of the whole site (§7), and §8
+covers protecting the bucket against deletion from inside Frappe — versioning,
+IAM, Object Lock and backups.
+
 ### Installation
 
 You can install this app using the [bench](https://github.com/frappe/bench) CLI:
@@ -162,6 +166,14 @@ Open **S3 Settings** (a single doctype, System Manager only) and fill it in.
 > ⚠️ **Do not** use `DEEP_ARCHIVE` (or `GLACIER`) for user-facing attachments —
 > a presigned download would fail until the object is restored. These tiers only
 > make sense for cold data such as backups.
+
+#### Doctype Scope
+
+| Field | Default | Description |
+| --- | --- | --- |
+| **Limit S3 Storage to Specific Doctypes** | Off | Off = site-wide: every upload goes to S3. On = only attachments of the doctypes listed below are stored in S3; everything else keeps using Frappe's local storage and the migration jobs leave it on disk. See §7. |
+| **Doctypes Stored in S3** | empty | One doctype per line (e.g. `Sales Invoice`), matched against the attachment's **Attached To DocType**. |
+| **Include Files Not Attached to a Document** | Off | Whether files that hang off no document — uploads from the File list, letter head / print logos, Web Form uploads before submission — also go to S3. They have no doctype to match, so they get their own switch. |
 
 #### Guest Access
 
@@ -331,6 +343,10 @@ them into S3 from **S3 Settings → S3 Operations**, which walks the safe order:
    pending) **and the reason each file failed**; re-run step 1 to retry failed or
    remaining files.
 
+> With **Limit S3 Storage to Specific Doctypes** on (§7), every step below — the
+> buttons, the console commands and the daily job — only ever touches attachments
+> inside that scope, and the pending count reflects it.
+
 Every file that fails or is missing is recorded in the **S3 Migration Error**
 doctype (file, reason, error) — the Migration Status dialog shows the most recent,
 and the full list is in that doctype's list view. The list is cleared at the start
@@ -402,6 +418,380 @@ bench --site <site> execute aws_s3_storage.aws_s3_storage.migrate.audit_local_li
    the migration to delete — migrated files have already left the pending set, so
    deletion is a separate step (each local copy is removed only after its S3 object
    is verified present **with a matching size**).
+
+### 7. Limiting S3 to specific doctypes
+
+By default the integration is **site-wide**: every upload goes to S3 and the
+migration moves every local file into the bucket. Turn on **Limit S3 Storage to
+Specific Doctypes** under **S3 Settings → Doctype Scope** to keep only part of
+your data there — a cautious rollout (start with one doctype, widen later), a
+cost or data-residency rule, or a doctype whose attachments must stay on the
+server.
+
+List the doctypes one per line:
+
+```
+Sales Invoice
+Purchase Invoice
+Employee
+```
+
+**What the scope is matched against.** Every attachment stores the document it
+hangs off in `File.attached_to_doctype` — the same value the File list shows as
+*Attached To DocType*. That is what the list is compared with, so it covers the
+attachments of those documents, whether they were added from the sidebar or
+through an **Attach** / **Attach Image** field. To see what your site actually
+has, run in `bench --site <site> console`:
+
+```python
+frappe.db.sql("""
+    SELECT COALESCE(NULLIF(attached_to_doctype, ''), '(not attached)') AS doctype,
+           COUNT(*) AS files
+    FROM `tabFile` WHERE is_folder = 0
+    GROUP BY doctype ORDER BY files DESC
+""", as_dict=True)
+```
+
+**What the scope changes**
+
+| | In scope | Out of scope |
+| --- | --- | --- |
+| New uploads | Stored in S3 | Stored on local disk (Frappe's default) — the same fallback the master switch uses |
+| Migration (manual **and** daily) | Migrated | Never touched; not counted as pending |
+| Files already in S3 | Served / moved / deleted as usual | **Also served / moved / deleted as usual** |
+| Backups (§3) | — | Unaffected: backups are not File records and have their own switch |
+
+The scope only decides **where a new object is written**. Narrowing it later
+never orphans anything: objects already in the bucket keep being served through
+presigned URLs, follow a privacy change between the `public/` and `private/`
+prefixes, and are removed when their File record is deleted, exactly as before.
+Nothing moves back to local disk on its own.
+
+**Migration Status** shows the active scope, and its *Pending* count is the
+number of files inside it — so you can widen the list and watch the count grow
+before starting a run.
+
+Notes and edge cases:
+
+- Attachments that must stay on local disk (§5) are excluded first, whatever the
+  scope says.
+- Restricting the scope with **no** doctype listed and the unattached switch off
+  means nothing is stored in S3 at all; the settings form warns you when you save
+  it. A doctype name that does not exist (a typo) gets the same warning.
+- Frappe deduplicates uploads by content hash *before* the storage hook runs. If
+  an out-of-scope upload is byte-identical to a file already in S3, Frappe reuses
+  that record's URL, so the new attachment points at the existing object too. It
+  is served normally, and the object is protected from deletion while either
+  record still references it (§4).
+- Print formats, letter heads, site logo, Web Form uploads before submission and
+  anything uploaded straight from the File list are *unattached* — they follow
+  **Include Files Not Attached to a Document**, not the doctype list.
+- **Audit Local Links** (§6) stays site-wide on purpose: it reports every field
+  that still contains a `/files/` link, whatever doctype the file itself belongs
+  to. With a restricted scope many of those are simply files that are meant to
+  stay on disk.
+
+### 8. Protecting the bucket from deletion (versioning, backup, Object Lock)
+
+Once attachments live in S3, a delete inside Frappe reaches into the bucket: the
+app removes the object when the File record that owns it is deleted. That is the
+correct default — otherwise every deleted attachment would be billed forever —
+but it means a mistaken bulk delete, a wrong cascade, a bad script or a stolen
+key can destroy files. This section is about making that **recoverable**, at the
+AWS layer, where nothing inside Frappe can undo it.
+
+#### 8.1 What actually deletes an object
+
+| Trigger | What the app does |
+| --- | --- |
+| A **File record is deleted** — from the File list, by a user deleting a document (attachments cascade), by a script, `frappe.delete_doc`, a bulk delete | `DeleteObject` **after the transaction commits**, and only if no other File record and no document's Attach field still holds that key (§4). A rolled-back delete removes nothing. |
+| **Privacy changes** (public ↔ private) | The object is copied to the other prefix and the old key is deleted after commit (unless something still references it). |
+| A delete that **fails** (permissions, network) | The key is queued in **S3 Deletion Queue** and retried hourly, up to 10 attempts, then marked `Failed` and left alone. |
+| **Migration step 3** / *Delete Local After Migration* | Deletes **local copies only** — never an S3 object. |
+| **Backup sync** (§3) | Never deletes anything in S3 (only the local backup file, if you enable that). |
+| Dropping / restoring the site database | Deletes nothing in S3. The File records disappear, the objects stay behind as orphans. |
+
+Nothing else in the app issues a delete. So the whole exposure is: *a File record
+disappears in Frappe → its object disappears in S3.* Everything below removes the
+"permanently" from that sentence.
+
+#### 8.2 Layer 1 — turn on Bucket Versioning (do this first)
+
+Versioning is the single most valuable setting here, and it needs no change in
+the app.
+
+```bash
+aws s3api put-bucket-versioning --bucket YOUR_BUCKET \
+  --versioning-configuration Status=Enabled
+
+aws s3api get-bucket-versioning --bucket YOUR_BUCKET   # -> {"Status": "Enabled"}
+```
+
+(Console: **Bucket → Properties → Bucket Versioning → Edit → Enable**.)
+
+With versioning on, the `DeleteObject` the app issues no longer destroys
+anything: S3 writes a **delete marker** on top of the key and keeps the bytes as
+a noncurrent version. The file 404s in Frappe — and comes back the moment you
+remove the marker.
+
+```bash
+# 1. find the object and its delete marker (the key is in the File record's
+#    hidden "S3 Key" field, or in the ?key= part of its file_url)
+aws s3api list-object-versions --bucket YOUR_BUCKET --prefix "private/" \
+  --query "DeleteMarkers[?contains(Key, 'report.pdf')].[Key,VersionId,LastModified]" \
+  --output table
+
+# 2. delete the delete marker -> the object is live again under the same key
+aws s3api delete-object --bucket YOUR_BUCKET \
+  --key "private/9f3c1a2b4d5e/report.pdf" \
+  --version-id "<delete-marker-version-id>"
+```
+
+Two things make versioning cheap here:
+
+- The app **never overwrites** an object — every upload gets its own
+  `public|private/<uuid>/<filename>` key — so versions only accumulate from
+  deletes and privacy moves, not from ordinary editing.
+- Presigned downloads are unaffected: a `GET` without a version id always serves
+  the current version.
+
+> Enable versioning **before** you run the migration (§6), so the whole library is
+> covered from the moment it lands in the bucket.
+
+#### 8.3 Layer 2 — take permanent deletion away from the app (IAM)
+
+Versioning protects you only while nobody can delete the versions themselves. The
+app never needs to: it always calls `DeleteObject` **without** a version id. So
+deny the destructive actions on the *app's own* IAM user — add this statement to
+the policy from §1.2:
+
+```json
+{
+  "Sid": "NeverDestroyHistory",
+  "Effect": "Deny",
+  "Action": [
+    "s3:DeleteObjectVersion",
+    "s3:DeleteObjectVersionTagging",
+    "s3:PutBucketVersioning",
+    "s3:PutLifecycleConfiguration",
+    "s3:PutBucketReplication",
+    "s3:PutBucketPolicy",
+    "s3:DeleteBucketPolicy",
+    "s3:DeleteBucket",
+    "s3:PutObjectRetention",
+    "s3:PutObjectLegalHold",
+    "s3:BypassGovernanceRetention"
+  ],
+  "Resource": [
+    "arn:aws:s3:::YOUR_BUCKET",
+    "arn:aws:s3:::YOUR_BUCKET/*"
+  ]
+}
+```
+
+An explicit `Deny` beats any `Allow`, so even a compromised key or a future
+policy edit cannot purge version history, switch versioning off, or add a
+lifecycle rule that expires everything tomorrow. Nothing the app does is
+affected.
+
+> Attach this to the **application's** IAM user only — not account-wide. An
+> administrator still needs `s3:DeleteObjectVersion` to perform the restore in
+> §8.2 and to clean up orphans.
+
+#### 8.4 Layer 3 — no deletion at all (optional, stricter)
+
+If you want Frappe to be *unable* to remove anything from the bucket, drop
+`s3:DeleteObject` from the Allow statement in §1.2 as well. Know exactly what you
+are choosing:
+
+- Every delete fails, is queued in **S3 Deletion Queue**, retried hourly 10 times,
+  then marked `Failed`. Nothing breaks in Frappe, and the queue stops growing per
+  key — but it becomes a log of objects you must clean up yourself.
+- Deleted attachments keep costing storage forever, with no lifecycle rule able to
+  reap them (the objects stay *current*, so `NoncurrentVersionExpiration` never
+  applies to them).
+- **A privacy change stops being airtight.** Making a public file private copies
+  the object to `private/…` but can no longer remove the old `public/…` copy — and
+  a `public/` key is served to anyone who has the link, without a permission check.
+  Anyone who kept the old URL keeps access.
+
+For almost every site, §8.2 + §8.3 (versioning + deny version deletes) is the
+better trade: deletion still works, but it is always reversible.
+
+#### 8.5 Layer 4 — MFA Delete
+
+Requires the **root** account credentials and the CLI (it cannot be set in the
+console):
+
+```bash
+aws s3api put-bucket-versioning --bucket YOUR_BUCKET \
+  --versioning-configuration Status=Enabled,MFADelete=Enabled \
+  --mfa "arn:aws:iam::ACCOUNT_ID:mfa/root-account-mfa-device 123456"
+```
+
+Deleting a *version* or turning versioning off then requires a fresh MFA code.
+The app is unaffected — a plain `DeleteObject` that writes a delete marker is
+still allowed.
+
+#### 8.6 Layer 5 — Object Lock (WORM / ransomware protection)
+
+Object Lock makes versions genuinely immutable for a retention period. It
+requires versioning, and is enabled at bucket creation or afterwards on a
+versioned bucket:
+
+```bash
+aws s3api put-object-lock-configuration --bucket YOUR_BUCKET \
+  --object-lock-configuration '{
+    "ObjectLockEnabled": "Enabled",
+    "Rule": { "DefaultRetention": { "Mode": "GOVERNANCE", "Days": 30 } }
+  }'
+```
+
+- **GOVERNANCE** — versions cannot be deleted for 30 days; an administrator with
+  `s3:BypassGovernanceRetention` can override. Recommended.
+- **COMPLIANCE** — nobody can delete them before the period ends, root included.
+  Use only if you must, and start with a short retention: you are committing to
+  pay for that storage no matter what.
+
+The app keeps working unchanged: uploads are new keys, and its version-less
+delete still just writes a delete marker.
+
+#### 8.7 Layer 6 — a copy outside the bucket
+
+Versioning protects the objects; it does not protect the *bucket*. For a real
+disaster copy, replicate to a second bucket — ideally in another AWS account, so
+a compromise of the site's credentials cannot reach it:
+
+```bash
+aws s3api put-bucket-replication --bucket YOUR_BUCKET --replication-configuration '{
+  "Role": "arn:aws:iam::ACCOUNT_ID:role/s3-replication-role",
+  "Rules": [{
+    "ID": "copy-everything",
+    "Priority": 0,
+    "Filter": {},
+    "Status": "Enabled",
+    "DeleteMarkerReplication": { "Status": "Disabled" },
+    "Destination": {
+      "Bucket": "arn:aws:s3:::YOUR_BUCKET-dr",
+      "Account": "DESTINATION_ACCOUNT_ID",
+      "StorageClass": "STANDARD_IA",
+      "AccessControlTranslation": { "Owner": "Destination" }
+    }
+  }]
+}'
+```
+
+Both buckets must have versioning enabled. Keep `DeleteMarkerReplication`
+**disabled**: deletes in Frappe then never hide anything in the copy. (Version
+deletions are never replicated by S3 in any case.)
+
+**AWS Backup** is the managed alternative — point a backup plan at the bucket for
+scheduled, point-in-time restores into a separate vault, and turn on **Vault
+Lock** to make the recovery points themselves immutable. It also requires
+versioning on the bucket.
+
+#### 8.8 Keep the cost of all this bounded (lifecycle rules)
+
+Versioning without a lifecycle rule grows forever. This one keeps 90 days of
+deleted files, tidies up delete markers and aborted uploads, and ages backups
+into cheap storage:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "keep-90-days-of-deleted-files",
+      "Filter": { "Prefix": "" },
+      "Status": "Enabled",
+      "NoncurrentVersionExpiration": { "NoncurrentDays": 90 },
+      "Expiration": { "ExpiredObjectDeleteMarker": true },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+    },
+    {
+      "ID": "backups-cheap-and-capped",
+      "Filter": { "Prefix": "backups/" },
+      "Status": "Enabled",
+      "Transitions": [{ "Days": 30, "StorageClass": "GLACIER_IR" }],
+      "Expiration": { "Days": 365 }
+    }
+  ]
+}
+```
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket YOUR_BUCKET \
+  --lifecycle-configuration file://lifecycle.json
+```
+
+> ⚠️ `NoncurrentDays` **is** your recovery window: after it passes, a deleted
+> attachment is gone for good. Pick a number you can live with (90 days is a
+> reasonable default; regulated data usually wants more). Never apply an
+> `Expiration.Days` rule to the `public/` or `private/` prefixes — that deletes
+> live attachments.
+
+#### 8.9 Inside Frappe
+
+The AWS layers above are what actually protect the data; these reduce how often
+you need them:
+
+- The app already refuses to delete an object that another File record, or a
+  document's **Attach** field, still points at (§4) — so an Amend, a duplicated
+  upload or a URL copied onto another document never loses its file.
+- Take `delete` on the **File** doctype away from everyone but System Manager
+  (Role Permissions Manager). Note this stops deletion *from the File list*, not
+  the cascade that removes attachments when their document is deleted — that runs
+  with permissions ignored, which is exactly why §8.2 matters.
+- Keep **Delete Local After Migration** off until you have verified a sample (§6);
+  until then the local copy is a second copy.
+- Turn on **Enable Daily Backup Sync** (§3). A database backup restores the File
+  *records*; the objects are protected separately by versioning.
+
+#### 8.10 Restoring a deleted attachment end to end
+
+A file has two halves — the object in the bucket and the File record that
+describes it — and a delete usually removes both.
+
+1. **Bring the object back**: remove its delete marker (§8.2).
+2. **Bring the record back**. If a document's Attach field still holds the URL,
+   the app can rebuild it for you:
+
+   ```bash
+   bench --site <site> execute \
+     aws_s3_storage.patches.v1_0.restore_missing_file_records.execute
+   ```
+
+   Otherwise recreate it in `bench --site <site> console`:
+
+   ```python
+   from aws_s3_storage.aws_s3_storage import s3_utils
+
+   key = "private/9f3c1a2b4d5e/report.pdf"
+   frappe.get_doc({
+       "doctype": "File",
+       "file_name": "report.pdf",
+       "is_private": 1,
+       "attached_to_doctype": "Sales Invoice",
+       "attached_to_name": "SINV-0001",
+       "file_url": s3_utils._build_file_url(key),
+       "s3_key": key,
+   }).insert(ignore_permissions=True)
+   frappe.db.commit()
+   ```
+
+   Use `is_private: 1` for a `private/` key and `0` for a `public/` one — the
+   prefix and the flag must agree, or the next save will move the object.
+
+#### 8.11 Recommended baseline
+
+1. **Bucket Versioning: Enabled** — before the migration runs.
+2. The **`NeverDestroyHistory` deny** (§8.3) on the app's IAM user.
+3. A **lifecycle rule**: noncurrent versions 90 days, expired delete markers,
+   aborted multipart uploads after 7 days.
+4. **Daily Backup Sync** on, with `backups/` transitioned to `GLACIER_IR`.
+5. Regulated or high-value data: add **Object Lock (GOVERNANCE, 30 days)** and
+   **replication to a second account**.
+6. **Do the restore drill once** (§8.10) on a throwaway attachment. A recovery
+   path you have never tested is not a backup.
 
 ---
 
