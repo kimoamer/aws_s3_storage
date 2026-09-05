@@ -400,6 +400,208 @@ class TestS3Settings(FrappeTestCase):
 		doc._validate_doctype_scope()
 		self.assertEqual(doc.scoped_doctypes, "ToDo\nContact")
 
+	# --- scope: deduplication must not cross storages ----------------------
+
+	def _file_with_content(self, **fields):
+		"""A File doc holding content, as it is mid-insert (never saved)."""
+		from aws_s3_storage.aws_s3_storage.file_override import S3File
+
+		doc = S3File({"doctype": "File", "file_name": "report.pdf", "is_private": 1, **fields})
+		doc._content = b"data"
+		return doc
+
+	def test_out_of_scope_upload_does_not_inherit_an_s3_object(self):
+		# Frappe reuses a matching content hash before the storage hook runs: an
+		# out-of-scope attachment would silently end up on the S3 object.
+		self._restrict_to("Sales Invoice")
+		key = "private/uid/report.pdf"
+		doc = self._file_with_content(
+			attached_to_doctype="Lead", file_url=s3_utils._build_file_url(key), s3_key=key
+		)
+
+		with patch.object(File, "save_file") as save_file:
+			doc._enforce_storage_location()
+
+		save_file.assert_called_once()
+		self.assertTrue(save_file.call_args.kwargs["ignore_existing_file_check"])
+		self.assertIsNone(doc.file_url)  # cleared, so the rewrite picks local storage
+		self.assertIsNone(doc.s3_key)
+
+	def test_in_scope_upload_does_not_stay_on_a_local_duplicate(self):
+		# The mirror image: an identical file uploaded before the bucket existed
+		# would keep an in-scope attachment on local disk forever.
+		self._restrict_to("Sales Invoice")
+		doc = self._file_with_content(
+			attached_to_doctype="Sales Invoice", file_url="/private/files/report.pdf"
+		)
+
+		with patch.object(File, "save_file") as save_file:
+			doc._enforce_storage_location()
+
+		save_file.assert_called_once()
+		self.assertTrue(save_file.call_args.kwargs["ignore_existing_file_check"])
+		self.assertIsNone(doc.file_url)
+
+	def test_storage_location_is_left_alone_when_it_is_already_right(self):
+		self._restrict_to("Sales Invoice")
+		key = "private/uid/report.pdf"
+		in_s3 = self._file_with_content(
+			attached_to_doctype="Sales Invoice", file_url=s3_utils._build_file_url(key), s3_key=key
+		)
+		local = self._file_with_content(attached_to_doctype="Lead", file_url="/private/files/report.pdf")
+
+		with patch.object(File, "save_file") as save_file:
+			in_s3._enforce_storage_location()
+			local._enforce_storage_location()
+
+		save_file.assert_not_called()
+
+	def test_an_attachment_copy_without_content_is_never_rewritten(self):
+		# Amend re-inserts attachments pointing at the original's object; there is
+		# nothing to write, and the object belongs to the record it came from.
+		from aws_s3_storage.aws_s3_storage.file_override import S3File
+
+		self._restrict_to("Sales Invoice")
+		key = "private/uid/report.pdf"
+		doc = S3File(
+			{
+				"doctype": "File",
+				"file_name": "report.pdf",
+				"is_private": 1,
+				"attached_to_doctype": "Lead",
+				"file_url": s3_utils._build_file_url(key),
+				"s3_key": key,
+			}
+		)
+
+		with patch.object(File, "save_file") as save_file:
+			doc._enforce_storage_location()
+
+		save_file.assert_not_called()
+		self.assertEqual(doc.s3_key, key)
+
+	# --- scope: files that are attached (or re-attached) later --------------
+
+	def _reevaluate(self, **fields):
+		"""Run the File on_update hook and return the jobs it queued."""
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		doc = frappe._dict(name="F1", **fields)
+		with patch.object(frappe, "enqueue") as enqueue:
+			migrate.reevaluate_scope(doc)
+		return enqueue.call_args_list
+
+	def test_web_form_upload_moves_to_s3_once_it_is_attached(self):
+		# A Web Form uploads before the document exists, so the file starts
+		# unattached and local; submitting attaches it to an in-scope doctype.
+		self._restrict_to("Sales Invoice")
+		self.assertEqual(self._reevaluate(file_url="/private/files/wf.pdf", attached_to_doctype=None), [])
+
+		jobs = self._reevaluate(file_url="/private/files/wf.pdf", attached_to_doctype="Sales Invoice")
+		self.assertEqual(len(jobs), 1)
+		self.assertEqual(jobs[0].kwargs["file_name"], "F1")
+		self.assertTrue(jobs[0].kwargs["enqueue_after_commit"])
+
+	def test_attachment_copied_to_an_out_of_scope_doctype_leaves_s3(self):
+		self._restrict_to("Sales Invoice")
+		key = "private/uid/report.pdf"
+		jobs = self._reevaluate(
+			file_url=s3_utils._build_file_url(key), s3_key=key, attached_to_doctype="Lead"
+		)
+		self.assertEqual(len(jobs), 1)
+
+	def test_reevaluate_is_a_noop_when_nothing_is_out_of_place(self):
+		key = "private/uid/report.pdf"
+		s3_url = s3_utils._build_file_url(key)
+
+		# Scope off: the hook never fires at all.
+		self.assertEqual(self._reevaluate(file_url="/files/a.pdf", attached_to_doctype="Lead"), [])
+
+		self._restrict_to("Sales Invoice")
+		# Already where it belongs, in both directions.
+		self.assertEqual(
+			self._reevaluate(file_url=s3_url, s3_key=key, attached_to_doctype="Sales Invoice"), []
+		)
+		self.assertEqual(self._reevaluate(file_url="/files/a.pdf", attached_to_doctype="Lead"), [])
+		# An external link has nothing to move, and folders are not files.
+		self.assertEqual(
+			self._reevaluate(file_url="https://example.com/a.pdf", attached_to_doctype="Sales Invoice"),
+			[],
+		)
+		self.assertEqual(
+			self._reevaluate(is_folder=1, file_url="/files/a.pdf", attached_to_doctype="Sales Invoice"),
+			[],
+		)
+
+	def test_move_file_for_scope_picks_the_right_direction(self):
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		self._restrict_to("Sales Invoice")
+		key = "private/uid/report.pdf"
+		to_s3 = frappe._dict(
+			name="F1", is_folder=0, file_url="/private/files/report.pdf", attached_to_doctype="Sales Invoice"
+		)
+		to_disk = frappe._dict(
+			name="F2",
+			is_folder=0,
+			file_url=s3_utils._build_file_url(key),
+			s3_key=key,
+			attached_to_doctype="Lead",
+		)
+
+		for doc, expected in ((to_s3, "up"), (to_disk, "down")):
+			with (
+				self._file_doc(doc),
+				patch.object(frappe.db, "exists", return_value=True),
+				patch.object(migrate, "migrate_file", return_value="migrated") as up,
+				patch.object(migrate, "move_file_to_disk") as down,
+				patch.object(frappe.db, "commit"),
+			):
+				migrate.move_file_for_scope(doc.name)
+			self.assertEqual(up.called, expected == "up")
+			self.assertEqual(down.called, expected == "down")
+
+	def test_cleanup_never_touches_a_file_kept_local_by_the_scope(self):
+		# cleanup only walks records that already carry an s3_key, and it keeps any
+		# local file another record still points at — so an out-of-scope twin that
+		# shares the name is safe.
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		self._restrict_to("Sales Invoice")
+		tmp = tempfile.NamedTemporaryFile(delete=False)
+		tmp.write(b"data")
+		tmp.close()
+		try:
+			with (
+				patch.object(migrate, "_full_path", return_value=tmp.name),
+				# an out-of-scope File record still points at this local URL
+				patch.object(frappe.db, "exists", return_value=True),
+				patch.object(s3_utils, "object_exists", return_value=True) as obj_exists,
+			):
+				removed = migrate._safe_remove_local(
+					"/files/report.pdf", "public/u/report.pdf", MagicMock(), "b"
+				)
+			self.assertFalse(removed)
+			self.assertTrue(os.path.exists(tmp.name))
+			obj_exists.assert_not_called()  # bailed out before even asking S3
+		finally:
+			os.unlink(tmp.name)
+
+	def test_cleanup_query_only_covers_migrated_files(self):
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		self._restrict_to("Sales Invoice")
+		captured = []
+
+		def fake_get_all(doctype, filters=None, **kwargs):
+			captured.append(filters)
+			return []
+
+		with patch.object(frappe, "get_all", side_effect=fake_get_all):
+			migrate.cleanup_migrated_local_files()
+
+		self.assertEqual(captured[0]["s3_key"], ["not in", ["", None]])
+
 	# --- write_file_to_s3 --------------------------------------------------
 
 	@patch.object(s3_utils, "get_s3_client")
