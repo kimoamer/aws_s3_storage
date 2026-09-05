@@ -31,7 +31,7 @@ frappe.ui.form.on("S3 Settings", {
 			() => {
 				frappe.confirm(
 					__(
-						"Upload local files to S3 in the background and repoint their records? Local copies are kept — reclaim disk space later with step 3."
+						"Upload local files to S3 in the background and repoint their records? Only doctypes inside the configured scope are touched. Local copies are kept — reclaim disk space later with step 3."
 					),
 					() => {
 						frappe.call({
@@ -153,6 +153,7 @@ frappe.ui.form.on("S3 Settings", {
 							message:
 								`<table class="table table-bordered">
 								<tr><td>${__("Status")}</td><td><b>${frappe.utils.escape_html(s.status || "Idle")}</b></td></tr>
+								<tr><td>${__("Scope")}</td><td>${frappe.utils.escape_html(s.scope || "")}</td></tr>
 								<tr><td>${__("Total")}</td><td>${s.total_files || 0}</td></tr>
 								<tr><td>${__("Migrated")}</td><td>${s.migrated_files || 0}</td></tr>
 								<tr><td>${__("Failed")}</td><td>${s.failed_files || 0}</td></tr>

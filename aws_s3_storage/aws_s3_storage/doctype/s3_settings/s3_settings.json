@@ -20,6 +20,10 @@
   "enable_backup_sync",
   "backup_storage_class",
   "delete_local_backup_after_sync",
+  "scope_section",
+  "restrict_to_doctypes",
+  "scoped_doctypes",
+  "include_unattached_files",
   "guest_access_section",
   "allow_guest_downloads",
   "guest_upload_doctypes",
@@ -126,6 +130,33 @@
    "label": "Delete Local Backup After Sync"
   },
   {
+   "fieldname": "scope_section",
+   "fieldtype": "Section Break",
+   "label": "Doctype Scope"
+  },
+  {
+   "default": "0",
+   "description": "Off by default: every upload on the site goes to S3. When on, only attachments of the doctypes listed below are stored in S3 \u2014 everything else keeps using Frappe's local storage, and the migration jobs leave it alone. Files already in the bucket keep being served and deleted normally either way.",
+   "fieldname": "restrict_to_doctypes",
+   "fieldtype": "Check",
+   "label": "Limit S3 Storage to Specific Doctypes"
+  },
+  {
+   "depends_on": "restrict_to_doctypes",
+   "description": "One doctype per line, e.g. Sales Invoice. Matched against the attachment's Attached To Doctype.",
+   "fieldname": "scoped_doctypes",
+   "fieldtype": "Small Text",
+   "label": "Doctypes Stored in S3"
+  },
+  {
+   "default": "0",
+   "depends_on": "restrict_to_doctypes",
+   "description": "Also store files that are not attached to any document (uploads from the File list, letter head / print logos, Web Form uploads before submission). Off means those stay on local disk.",
+   "fieldname": "include_unattached_files",
+   "fieldtype": "Check",
+   "label": "Include Files Not Attached to a Document"
+  },
+  {
    "fieldname": "guest_access_section",
    "fieldtype": "Section Break",
    "label": "Guest Access"
@@ -177,7 +208,7 @@
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2026-08-09 00:00:00.000000",
+ "modified": "2026-09-05 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Aws S3 Storage",
  "name": "S3 Settings",

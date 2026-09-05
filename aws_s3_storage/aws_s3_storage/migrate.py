@@ -19,6 +19,9 @@ are skipped for the rest of a run instead of looping. Uploads stream from disk
 
 Attachments that an app rewrites in place by path (see
 ``s3_utils.is_local_only_file``) are always skipped: they have to stay on disk.
+So are files outside the configured doctype scope (see ``s3_utils.in_scope``) —
+with "Limit S3 Storage to Specific Doctypes" on, the migration only ever touches
+attachments of the listed doctypes, and the pending count reflects that.
 """
 
 import mimetypes
@@ -57,15 +60,46 @@ _PENDING_FILTERS = {
 }
 
 
-def _pending_local_files(limit, exclude=None):
-	filters = dict(_PENDING_FILTERS)
-	if exclude:
-		filters["name"] = ["not in", list(exclude)]
-	return frappe.get_all("File", filters=filters, pluck="name", limit=limit, order_by="creation asc")
+def _pending_filter_sets(settings=None):
+	"""The File filters describing what is still to migrate, honouring the scope.
+
+	One dict per query rather than a single OR: both halves of a restricted scope
+	("attached to one of these doctypes" and "attached to nothing") then stay plain
+	indexed lookups that ``frappe.db.count`` can run as well. The sets are mutually
+	exclusive, so nothing is counted twice. An empty list means the configured scope
+	covers no file at all.
+	"""
+	settings = settings if settings is not None else frappe.get_single("S3 Settings")
+	if not s3_utils.is_scope_restricted(settings):
+		return [dict(_PENDING_FILTERS)]
+
+	filter_sets = []
+	doctypes = sorted(s3_utils.scoped_doctypes(settings))
+	if doctypes:
+		filter_sets.append({**_PENDING_FILTERS, "attached_to_doctype": ["in", doctypes]})
+	if cint(settings.get("include_unattached_files")):
+		# "is not set" covers both NULL and '' — a File attached to nothing may carry
+		# either, depending on how it was created.
+		filter_sets.append({**_PENDING_FILTERS, "attached_to_doctype": ["is", "not set"]})
+	return filter_sets
 
 
-def count_pending():
-	return frappe.db.count("File", dict(_PENDING_FILTERS))
+def _pending_local_files(limit, exclude=None, settings=None):
+	names = []
+	for filters in _pending_filter_sets(settings):
+		filters = dict(filters)
+		if exclude:
+			filters["name"] = ["not in", list(exclude)]
+		names += frappe.get_all(
+			"File", filters=filters, pluck="name", limit=limit - len(names), order_by="creation asc"
+		)
+		if len(names) >= limit:
+			break
+	return names
+
+
+def count_pending(settings=None):
+	return sum(frappe.db.count("File", filters) for filters in _pending_filter_sets(settings))
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +123,7 @@ def get_migration_status():
 	frappe.only_for("System Manager")
 	doc = frappe.get_single(STATUS_DOCTYPE)
 	status = {field: doc.get(field) for field in _STATUS_FIELDS}
+	status["scope"] = s3_utils.scope_description()
 	status["pending"] = count_pending()
 	status["errors"] = get_migration_errors(limit=20)
 	return status
@@ -269,7 +304,7 @@ def run_migration(batch_size=100, delete_local=0, time_budget=0, max_files=0, re
 
 	try:
 		while not _stop():
-			names = _pending_local_files(batch_size, exclude=done_not_migrated)
+			names = _pending_local_files(batch_size, exclude=done_not_migrated, settings=settings)
 			if not names:
 				break
 
@@ -301,7 +336,7 @@ def run_migration(batch_size=100, delete_local=0, time_budget=0, max_files=0, re
 		frappe.logger().error(f"S3 migration aborted: {e}")
 		raise
 
-	still_pending = bool(_pending_local_files(1, exclude=done_not_migrated))
+	still_pending = bool(_pending_local_files(1, exclude=done_not_migrated, settings=settings))
 	if time_budget and still_pending:
 		# Chained mode: continue in a fresh job.
 		_enqueue_run(batch_size, delete_local, time_budget)
@@ -351,13 +386,20 @@ def migrate_file(name, delete_local=0, s3=None, settings=None):
 	if s3_utils.is_local_only_file(doc):
 		return "skipped"
 
+	settings = settings or frappe.get_single("S3 Settings")
+
+	# Doctypes the admin kept out of S3 stay on disk. Checked here as well as in the
+	# pending query, so a direct call (bench execute) cannot move a file the scope
+	# excludes — and an out-of-scope file with no content is a skip, not an error.
+	if not s3_utils.in_scope(doc, settings):
+		return "skipped"
+
 	old_main_url = doc.file_url
 	local_path = _full_path(old_main_url)
 	if not local_path or not os.path.exists(local_path):
 		frappe.logger().error(f"S3 migration: content missing for File {name} ({old_main_url})")
 		return "missing"
 
-	settings = settings or frappe.get_single("S3 Settings")
 	bucket = settings.bucket_name
 	s3 = s3 or s3_utils.get_s3_client()
 

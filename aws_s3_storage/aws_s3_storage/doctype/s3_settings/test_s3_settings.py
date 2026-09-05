@@ -27,6 +27,9 @@ class TestS3Settings(FrappeTestCase):
 		frappe.db.set_single_value("S3 Settings", "enable_backup_sync", 0)
 		frappe.db.set_single_value("S3 Settings", "allow_guest_downloads", 0)
 		frappe.db.set_single_value("S3 Settings", "guest_upload_doctypes", "")
+		frappe.db.set_single_value("S3 Settings", "restrict_to_doctypes", 0)
+		frappe.db.set_single_value("S3 Settings", "scoped_doctypes", "")
+		frappe.db.set_single_value("S3 Settings", "include_unattached_files", 0)
 
 	# --- helpers -----------------------------------------------------------
 
@@ -250,6 +253,152 @@ class TestS3Settings(FrappeTestCase):
 		)
 		with patch.object(frappe, "get_doc", return_value=doc):
 			self.assertEqual(migrate.migrate_file("F1"), "skipped")
+
+	# --- doctype scope -----------------------------------------------------
+
+	def _restrict_to(self, doctypes, include_unattached=0):
+		frappe.db.set_single_value("S3 Settings", "restrict_to_doctypes", 1)
+		frappe.db.set_single_value("S3 Settings", "scoped_doctypes", doctypes)
+		frappe.db.set_single_value("S3 Settings", "include_unattached_files", include_unattached)
+
+	def test_scope_is_site_wide_by_default(self):
+		# Nothing configured -> every doctype (and every unattached file) uses S3.
+		self.assertTrue(s3_utils.in_scope(frappe._dict(attached_to_doctype="Sales Invoice")))
+		self.assertTrue(s3_utils.in_scope(frappe._dict()))
+		self.assertFalse(s3_utils.is_scope_restricted())
+
+	def test_in_scope_only_for_listed_doctypes(self):
+		self._restrict_to("Sales Invoice\nPurchase Invoice")
+		self.assertTrue(s3_utils.in_scope(frappe._dict(attached_to_doctype="Sales Invoice")))
+		self.assertTrue(s3_utils.in_scope(attached_to_doctype="Purchase Invoice"))
+		self.assertFalse(s3_utils.in_scope(frappe._dict(attached_to_doctype="Lead")))
+
+	def test_unattached_files_follow_their_own_switch(self):
+		# A file that hangs off no document has no doctype to match.
+		self._restrict_to("Sales Invoice")
+		self.assertFalse(s3_utils.in_scope(frappe._dict()))
+		self.assertFalse(s3_utils.in_scope(frappe._dict(attached_to_doctype="")))
+
+		self._restrict_to("Sales Invoice", include_unattached=1)
+		self.assertTrue(s3_utils.in_scope(frappe._dict()))
+		self.assertFalse(s3_utils.in_scope(frappe._dict(attached_to_doctype="Lead")))
+
+	def test_empty_scope_stores_nothing_in_s3(self):
+		self._restrict_to("")
+		self.assertFalse(s3_utils.in_scope(frappe._dict(attached_to_doctype="Sales Invoice")))
+		self.assertFalse(s3_utils.in_scope(frappe._dict()))
+
+	def test_scope_description(self):
+		self.assertEqual(s3_utils.scope_description(), "All doctypes")
+		self._restrict_to("Sales Invoice")
+		self.assertEqual(s3_utils.scope_description(), "Sales Invoice")
+		self._restrict_to("Sales Invoice", include_unattached=1)
+		self.assertEqual(s3_utils.scope_description(), "Sales Invoice, Files not attached to a document")
+
+	def test_write_falls_back_to_local_for_out_of_scope_doctype(self):
+		self._restrict_to("Sales Invoice")
+		doc = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": "cv.pdf",
+				"attached_to_doctype": "Lead",
+				"attached_to_name": "LEAD-0001",
+				"is_private": 1,
+			}
+		)
+		with (
+			patch.object(s3_utils, "get_s3_client") as client,
+			patch.object(
+				s3_utils, "_save_to_filesystem", return_value={"file_url": "/private/files/cv.pdf"}
+			) as fallback,
+		):
+			result = s3_utils.write_file_to_s3(doc)
+
+		client.assert_not_called()
+		fallback.assert_called_once()
+		self.assertEqual(result["file_url"], "/private/files/cv.pdf")
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_write_uses_s3_for_a_scoped_doctype(self, mock_get_client):
+		self._restrict_to("Sales Invoice")
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+		doc = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": "invoice.pdf",
+				"attached_to_doctype": "Sales Invoice",
+				"attached_to_name": "SINV-0001",
+				"is_private": 1,
+				"content": b"data",
+				"decode": 0,
+			}
+		)
+
+		with patch.object(s3_utils, "_save_to_filesystem") as fallback:
+			result = s3_utils.write_file_to_s3(doc)
+
+		fallback.assert_not_called()
+		s3.put_object.assert_called_once()
+		self.assertTrue(result["s3_key"].startswith("private/"))
+
+	def test_write_keeps_unattached_file_local_when_excluded(self):
+		# The legacy file_manager convention passes a name only: no doctype to match,
+		# so it follows the unattached switch (off here).
+		self._restrict_to("Sales Invoice")
+		with (
+			patch.object(s3_utils, "get_s3_client") as client,
+			patch.object(s3_utils, "_save_to_filesystem", return_value={"file_url": "/files/x"}) as fallback,
+		):
+			s3_utils.write_file_to_s3("logo.png", b"data")
+
+		client.assert_not_called()
+		fallback.assert_called_once()
+
+	def test_migration_skips_out_of_scope_file(self):
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		self._restrict_to("Sales Invoice")
+		doc = frappe._dict(
+			name="F1",
+			is_folder=0,
+			s3_key=None,
+			file_url="/private/files/cv.pdf",
+			file_name="cv.pdf",
+			attached_to_doctype="Lead",
+		)
+		with self._file_doc(doc):
+			self.assertEqual(migrate.migrate_file("F1"), "skipped")
+
+	def test_pending_filter_sets_follow_the_scope(self):
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		# Unrestricted: one query, no doctype condition at all.
+		self.assertEqual(len(migrate._pending_filter_sets()), 1)
+		self.assertNotIn("attached_to_doctype", migrate._pending_filter_sets()[0])
+
+		self._restrict_to("Sales Invoice\nPurchase Invoice")
+		filter_sets = migrate._pending_filter_sets()
+		self.assertEqual(len(filter_sets), 1)
+		self.assertEqual(filter_sets[0]["attached_to_doctype"], ["in", ["Purchase Invoice", "Sales Invoice"]])
+
+		# Unattached files are a second, mutually exclusive query.
+		self._restrict_to("Sales Invoice", include_unattached=1)
+		filter_sets = migrate._pending_filter_sets()
+		self.assertEqual(len(filter_sets), 2)
+		self.assertEqual(filter_sets[1]["attached_to_doctype"], ["is", "not set"])
+
+		# Restricted to nothing at all: no query, so the migration has nothing to do.
+		self._restrict_to("")
+		self.assertEqual(migrate._pending_filter_sets(), [])
+		self.assertEqual(migrate.count_pending(), 0)
+
+	def test_settings_normalise_the_doctype_list(self):
+		doc = frappe.get_single("S3 Settings")
+		doc.restrict_to_doctypes = 1
+		doc.scoped_doctypes = "  ToDo \n\nContact, ToDo\n"
+		doc._validate_doctype_scope()
+		self.assertEqual(doc.scoped_doctypes, "ToDo\nContact")
 
 	# --- write_file_to_s3 --------------------------------------------------
 
@@ -714,11 +863,11 @@ class TestS3Settings(FrappeTestCase):
 		names = ["F1", "F2"]
 		processed = []
 
-		def fake_pending(limit, exclude=None):
+		def fake_pending(limit, exclude=None, **kwargs):
 			exclude = set(exclude or [])
 			return [n for n in names if n not in exclude]
 
-		def fake_migrate(name, delete_local=1):
+		def fake_migrate(name, **kwargs):
 			processed.append(name)
 			return "missing"
 

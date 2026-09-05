@@ -24,3 +24,39 @@ class S3Settings(Document):
 			frappe.throw(
 				"Provide both Access Key ID and Secret Access Key, or leave both blank to use an IAM role."
 			)
+
+		self._validate_doctype_scope()
+
+	def _validate_doctype_scope(self):
+		"""Tidy the scope list and warn — never block — on a configuration that
+		silently keeps files local: a doctype name that does not exist (a typo, or an
+		app that was uninstalled) and a restriction that covers nothing at all.
+
+		Warnings rather than a throw on purpose: the form must stay saveable so the
+		restriction can always be turned off again.
+		"""
+		names = []
+		for line in (self.scoped_doctypes or "").replace(",", "\n").splitlines():
+			name = line.strip()
+			if name and name not in names:
+				names.append(name)
+		self.scoped_doctypes = "\n".join(names)
+
+		if not cint(self.restrict_to_doctypes):
+			return
+
+		unknown = [name for name in names if not frappe.db.exists("DocType", name)]
+		if unknown:
+			frappe.msgprint(
+				"These doctypes do not exist, so their files will stay on local disk: " + ", ".join(unknown),
+				title="Unknown doctype",
+				indicator="orange",
+			)
+
+		if not names and not cint(self.include_unattached_files):
+			frappe.msgprint(
+				"S3 storage is limited to specific doctypes but none are listed — "
+				"no new upload will be stored in S3.",
+				title="Nothing is in scope",
+				indicator="orange",
+			)

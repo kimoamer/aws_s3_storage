@@ -269,6 +269,78 @@ def is_local_only_file(file_doc=None, fname=None):
 
 
 # ---------------------------------------------------------------------------
+# Doctype scope
+# ---------------------------------------------------------------------------
+# By default the integration is site-wide: every upload goes to S3. A site that
+# wants only part of its data in the bucket — a cautious rollout, a cost or data
+# residency rule, a doctype whose attachments must stay on the server — turns on
+# "Limit S3 Storage to Specific Doctypes" and lists them. Everything outside the
+# list then keeps using Frappe's local storage, and the migration jobs leave it
+# on disk as well.
+#
+# Scope is read from the File's ``attached_to_doctype``, i.e. the document the
+# attachment hangs off. Files attached to nothing (an upload from the File list,
+# a letter head or print logo, a Web Form upload before submission) have no
+# doctype to match, so they follow the separate "Include Files Not Attached to a
+# Document" switch.
+#
+# The scope only decides where a *new* object is written. Objects already in the
+# bucket are served, moved between prefixes and deleted exactly as before,
+# whatever the scope says — narrowing it never orphans what is already there.
+# Backups are not File records and are unaffected (see sync_backups_to_s3).
+
+
+def _doctype_set(value):
+	"""Parse a newline (or comma) separated doctype list into a set of names."""
+	return {name.strip() for name in (value or "").replace(",", "\n").splitlines() if name.strip()}
+
+
+def is_scope_restricted(settings=None):
+	settings = settings if settings is not None else frappe.get_single("S3 Settings")
+	return bool(cint(settings.get("restrict_to_doctypes")))
+
+
+def scoped_doctypes(settings=None):
+	"""The doctypes S3 storage is limited to (empty when nothing is listed)."""
+	settings = settings if settings is not None else frappe.get_single("S3 Settings")
+	return _doctype_set(settings.get("scoped_doctypes"))
+
+
+def in_scope(file_doc=None, settings=None, attached_to_doctype=None):
+	"""True when this attachment belongs to a doctype S3 storage is enabled for.
+
+	``file_doc`` may be a File Document or any dict-like row carrying
+	``attached_to_doctype``; pass ``attached_to_doctype`` on its own when that is
+	all the caller knows. Always True while the restriction is off, so the default
+	behaviour (whole site in S3) is untouched.
+	"""
+	settings = settings if settings is not None else frappe.get_single("S3 Settings")
+	if not is_scope_restricted(settings):
+		return True
+
+	doctype = attached_to_doctype
+	if not doctype and file_doc is not None:
+		doctype = file_doc.get("attached_to_doctype")
+
+	if not doctype:
+		return bool(cint(settings.get("include_unattached_files")))
+
+	return doctype in scoped_doctypes(settings)
+
+
+def scope_description(settings=None):
+	"""One-line summary of the scope, for the admin UI."""
+	settings = settings if settings is not None else frappe.get_single("S3 Settings")
+	if not is_scope_restricted(settings):
+		return "All doctypes"
+
+	parts = sorted(scoped_doctypes(settings))
+	if cint(settings.get("include_unattached_files")):
+		parts.append("Files not attached to a document")
+	return ", ".join(parts) or "Nothing — no doctype is listed"
+
+
+# ---------------------------------------------------------------------------
 # Write / read
 # ---------------------------------------------------------------------------
 
@@ -290,8 +362,14 @@ def write_file_to_s3(file_or_fname, content=None, content_type=None, is_private=
 
 	# Master switch: when disabled — or before a bucket is configured — fall back to
 	# Frappe's default local storage instead of failing the upload. Attachments that
-	# an app rewrites in place by path (see is_local_only_file) take the same route.
-	if not _is_enabled(settings) or not settings.bucket_name or is_local_only_file(file_doc, fname):
+	# an app rewrites in place by path (see is_local_only_file), and doctypes outside
+	# the configured scope (see in_scope), take the same route.
+	if (
+		not _is_enabled(settings)
+		or not settings.bucket_name
+		or is_local_only_file(file_doc, fname)
+		or not in_scope(file_doc, settings)
+	):
 		return _save_to_filesystem(file_or_fname, content, content_type, is_private)
 
 	if file_doc is not None:
@@ -483,11 +561,7 @@ def _guest_may_read(file_doc, settings):
 	if (file_doc.get("owner") or "") != "Guest":
 		return False
 
-	allowed = {
-		doctype.strip()
-		for doctype in (settings.get("guest_upload_doctypes") or "").splitlines()
-		if doctype.strip()
-	}
+	allowed = _doctype_set(settings.get("guest_upload_doctypes"))
 	attached_to = file_doc.get("attached_to_doctype") or ""
 
 	# An empty allowlist means "any guest upload". A file that is not attached to
