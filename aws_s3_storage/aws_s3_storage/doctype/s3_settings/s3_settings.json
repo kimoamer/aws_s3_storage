@@ -6,6 +6,13 @@
  "editable_grid": 1,
  "engine": "InnoDB",
  "field_order": [
+  "environment_section",
+  "read_only_mode",
+  "storage_owner_id",
+  "column_break_env",
+  "inherited_storage_policy",
+  "storage_owner_site",
+  "storage_owner_claimed_at",
   "enabled",
   "bucket_name",
   "region",
@@ -33,6 +40,49 @@
   "auto_delete_after_migration"
  ],
  "fields": [
+  {
+   "fieldname": "environment_section",
+   "fieldtype": "Section Break",
+   "label": "Storage Ownership"
+  },
+  {
+   "default": "0",
+   "description": "Serve files from the bucket, but never create, move or delete anything in it. Covers every path: uploads (they fall back to local disk), deletions, privacy moves, thumbnails, the deletion queue, backup sync and the migration jobs.",
+   "fieldname": "read_only_mode",
+   "fieldtype": "Check",
+   "label": "Read-Only Mode (Never Modify the Bucket)"
+  },
+  {
+   "description": "Which environment owns this bucket. Set automatically on install; the matching value is kept in site_config.json, which is not part of a database backup \u2014 that is how a restored copy is told apart from the original.",
+   "fieldname": "storage_owner_id",
+   "fieldtype": "Data",
+   "label": "Storage Owner ID",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_env",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "Read Only",
+   "description": "What this site may do to objects another environment uploaded (files carrying a different owner id). Read Only is the safe answer and should stay unless you are certain this site owns those files.",
+   "fieldname": "inherited_storage_policy",
+   "fieldtype": "Select",
+   "label": "Files Owned by Another Environment",
+   "options": "Read Only\nFull Access"
+  },
+  {
+   "fieldname": "storage_owner_site",
+   "fieldtype": "Data",
+   "label": "Owner Site",
+   "read_only": 1
+  },
+  {
+   "fieldname": "storage_owner_claimed_at",
+   "fieldtype": "Datetime",
+   "label": "Ownership Claimed At",
+   "read_only": 1
+  },
   {
    "default": "1",
    "description": "When on, new uploads are stored in S3. When off (or before a bucket is configured), files fall back to Frappe's local storage. Existing S3 files keep working either way.",
@@ -89,7 +139,7 @@
   },
   {
    "default": "3600",
-   "description": "Lifetime of generated download links, in seconds (clamped to 60–604800).",
+   "description": "Lifetime of generated download links, in seconds (clamped to 60\u2013604800).",
    "fieldname": "presigned_url_expiry",
    "fieldtype": "Int",
    "label": "Presigned URL Expiry (seconds)"
@@ -115,7 +165,7 @@
   {
    "default": "STANDARD",
    "depends_on": "enable_backup_sync",
-   "description": "Storage tier for backups (independent of attachments — e.g. STANDARD_IA or GLACIER_IR for cheaper cold storage).",
+   "description": "Storage tier for backups (independent of attachments \u2014 e.g. STANDARD_IA or GLACIER_IR for cheaper cold storage).",
    "fieldname": "backup_storage_class",
    "fieldtype": "Select",
    "label": "Backup Storage Class",

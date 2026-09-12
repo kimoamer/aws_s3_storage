@@ -13,6 +13,8 @@ from botocore.exceptions import ClientError
 from frappe.model.document import Document
 from frappe.utils import cint
 
+from aws_s3_storage.aws_s3_storage import environment
+
 # Whitelisted method used to serve files back from S3 via short-lived presigned URLs.
 DOWNLOAD_METHOD = "aws_s3_storage.aws_s3_storage.s3_utils.download_file"
 # Fallback lifetime of a generated presigned URL, in seconds, when not configured.
@@ -334,9 +336,17 @@ def should_store_in_s3(file_doc=None, fname=None, settings=None):
 	The single answer used by the upload hook, by the deduplication guard in
 	S3File, and whenever an attachment is re-attached to another doctype — so all
 	three can never disagree about one file.
+
+	An environment that does not own the bucket (a restored copy of another site's
+	database, or a site in Read-Only Mode) answers False for everything: new
+	uploads then go to that site's own local disk instead of being written into
+	storage it does not own. Point it at its own bucket and claim that, and it is
+	a normal owner again.
 	"""
 	settings = settings if settings is not None else frappe.get_single("S3 Settings")
 	if not _is_enabled(settings) or not settings.bucket_name:
+		return False
+	if not environment.may_modify_storage(settings):
 		return False
 	if is_local_only_file(file_doc, fname):
 		return False
@@ -413,15 +423,20 @@ def write_file_to_s3(file_or_fname, content=None, content_type=None, is_private=
 	_delete_on_rollback(bucket, [key])
 
 	file_url = _build_file_url(key)
+	# Stamp which environment put this object in the bucket, so a site that later
+	# adopts the same bucket can still be kept away from files it did not create.
+	owner = environment.owner_stamp(settings)
 	if file_doc is not None:
 		file_doc.file_url = file_url
 		file_doc.s3_key = key
+		file_doc.s3_owner = owner
 
 	return {
 		"file_name": fname,
 		"file_url": file_url,
 		"file_size": len(content),
 		"s3_key": key,
+		"s3_owner": owner,
 	}
 
 
@@ -437,8 +452,15 @@ def read_file_from_s3(key):
 
 
 def upload_thumbnail(key, content, content_type):
-	"""Upload a generated thumbnail and return the URL used to serve it."""
+	"""Upload a generated thumbnail and return the URL used to serve it.
+
+	Returns None without writing anything when this environment does not own the
+	bucket: a thumbnail is a new object next to the original, so generating one
+	from a restored copy would still be a write into another site's storage.
+	"""
 	settings = frappe.get_single("S3 Settings")
+	if not environment.guard("upload a thumbnail", settings=settings):
+		return None
 	s3 = get_s3_client()
 	s3.put_object(
 		Bucket=settings.bucket_name,
@@ -483,6 +505,14 @@ def move_object_privacy(file_doc):
 		return
 
 	settings = frappe.get_single("S3 Settings")
+	# A privacy change is a copy *and* a delete in the bucket, and it repoints the
+	# record at the new key. From an environment that does not own the object,
+	# doing any part of that would break the attachment for its real owner, so the
+	# record keeps pointing at the object exactly where it is.
+	if not environment.guard(
+		"move an object between public/ and private/", file_doc=file_doc, settings=settings
+	):
+		return
 	bucket = settings.bucket_name
 	s3 = get_s3_client()
 
@@ -658,7 +688,39 @@ def test_connection():
 		frappe.throw(f"Could not connect to bucket '{settings.bucket_name}': {e}")
 
 	message = f"Successfully connected to bucket '{settings.bucket_name}'."
-	return f"{message}<br><br>{bucket_versioning_note(settings, s3)}"
+	return f"{message}<br><br>{ownership_note(settings)}<br><br>{bucket_versioning_note(settings, s3)}"
+
+
+def ownership_note(settings=None):
+	"""One line on whether this environment may modify the bucket."""
+	settings = settings if settings is not None else frappe.get_single("S3 Settings")
+	info = environment.ownership(settings)
+
+	if environment.read_only_mode(settings):
+		return (
+			"<b>Read-Only Mode is ON.</b> Files are served from the bucket, but nothing "
+			"in it is created, moved or deleted from this site."
+		)
+
+	if info.state == environment.FOREIGN:
+		return (
+			"<b>This environment does not own this storage.</b> "
+			f"{info.reason} New uploads go to this site's local disk and nothing in the "
+			"bucket is modified. Point this site at its own bucket and use "
+			"'Take Ownership of This Storage' to make it a normal owner."
+		)
+
+	if info.state == environment.UNCLAIMED:
+		return (
+			"<b>Ownership: not claimed yet.</b> Run <code>bench migrate</code>, or use "
+			"'Take Ownership of This Storage', so a copy of this database restored "
+			"elsewhere can be told apart from this site."
+		)
+
+	return (
+		f"<b>Ownership: this site owns the storage</b> (id <code>{frappe.utils.escape_html(info.owner_id)}</code>). "
+		"A copy of this database restored onto another site will not be able to modify it."
+	)
 
 
 def bucket_versioning_note(settings=None, s3=None):
@@ -715,6 +777,14 @@ def delete_file_from_s3(doc, only_thumbnail=False):
 			doc.delete_file_from_filesystem(only_thumbnail=only_thumbnail)
 		return
 
+	# An environment that does not own these objects unlinks only: the File record
+	# goes, the object stays. That is the whole point — a deletion on a restored
+	# copy of the database must not reach the files the original is still serving,
+	# and the reference check above it could not see them anyway, because it only
+	# ever queries the database it is running in.
+	if not environment.guard("delete an object", file_doc=doc):
+		return
+
 	# check_documents: a real deletion is the one case where an Attach field still
 	# holding the URL has to win, because nothing would bring the object back.
 	_delete_after_commit(get_bucket(), keys, check_references=True, check_documents=True)
@@ -735,6 +805,16 @@ def _delete_on_rollback(bucket, keys):
 
 
 def _delete_keys(bucket, keys, check_references=False, check_documents=False):
+	# Last line of defence. Every caller checks first, but these run inside
+	# after_commit / after_rollback callbacks and from background jobs, so the one
+	# place that actually issues delete_object checks again rather than trusting
+	# that it was reached through a guarded path. Only the environment is checked
+	# here — a bare key carries no owner to compare, and the callers that have the
+	# record already made that check.
+	if not environment.may_modify_storage():
+		environment.report_blocked("delete an object", detail=", ".join(keys))
+		return
+
 	s3 = get_s3_client()
 	for key in keys:
 		# Never delete an object another File still points at (dedup / shared use).
@@ -957,7 +1037,35 @@ def _insert_deletion_row(bucket, key, error=None):
 
 
 def process_deletion_queue():
-	"""Scheduler job: retry queued S3 deletions."""
+	"""Scheduler job: retry queued S3 deletions.
+
+	The queue is an ordinary doctype, so its rows are restored along with the rest
+	of the database. Every row is therefore treated as an *instruction from
+	whichever environment wrote it*, not as a fact:
+
+	* an environment that does not own the bucket parks the whole queue instead of
+	  running it — otherwise a restored copy would carry out deletions the original
+	  site asked for, against objects the original is still serving;
+	* a row naming a different bucket than the one configured now is parked too: it
+	  was queued against storage this site no longer points at;
+	* and the reference check is re-run before each delete. The first attempt
+	  failed some time ago; the file may well be in use again by now (an Amend, a
+	  document that inherited the URL), and the queue is the one delete path that
+	  would otherwise never look.
+
+	Parked rows keep their key and are visible as ``Blocked`` in the list, so they
+	can be reviewed and released deliberately.
+	"""
+	settings = frappe.get_single("S3 Settings")
+
+	if not environment.may_modify_storage(settings):
+		blocked = _block_pending_deletions(environment.blocked_reason(settings))
+		if blocked:
+			environment.report_blocked(
+				"run the deletion queue", detail=f"{blocked} row(s) parked", settings=settings
+			)
+		return
+
 	rows = frappe.get_all(
 		"S3 Deletion Queue",
 		filters={"status": "Pending"},
@@ -967,8 +1075,23 @@ def process_deletion_queue():
 	if not rows:
 		return
 
+	bucket = settings.bucket_name
 	s3 = get_s3_client()
 	for row in rows:
+		if row.bucket != bucket:
+			_park_deletion(
+				row.name,
+				f"Blocked: queued against bucket '{row.bucket}', this site now uses '{bucket}'.",
+			)
+			continue
+
+		# Re-check now, not when the row was written: a key that came back into use
+		# since the failed attempt must not be deleted on the retry.
+		if _key_is_referenced(row.s3_key, check_documents=True):
+			frappe.delete_doc("S3 Deletion Queue", row.name, ignore_permissions=True, force=True)
+			frappe.logger().info(f"S3 deletion queue: {row.s3_key} is referenced again — dropped the request")
+			continue
+
 		try:
 			s3.delete_object(Bucket=row.bucket, Key=row.s3_key)
 			frappe.delete_doc("S3 Deletion Queue", row.name, ignore_permissions=True, force=True)
@@ -986,6 +1109,26 @@ def process_deletion_queue():
 	frappe.db.commit()
 
 
+def _park_deletion(name, reason):
+	frappe.db.set_value(
+		"S3 Deletion Queue", name, {"status": "Blocked", "last_error": reason}, update_modified=False
+	)
+
+
+def _block_pending_deletions(reason):
+	"""Park every pending row; returns how many were parked."""
+	count = frappe.db.count("S3 Deletion Queue", {"status": "Pending"})
+	if count:
+		frappe.db.set_value(
+			"S3 Deletion Queue",
+			{"status": "Pending"},
+			{"status": "Blocked", "last_error": f"Blocked: {reason}"},
+			update_modified=False,
+		)
+		frappe.db.commit()
+	return count
+
+
 # ---------------------------------------------------------------------------
 # Backups
 # ---------------------------------------------------------------------------
@@ -994,6 +1137,13 @@ def process_deletion_queue():
 def sync_backups_to_s3():
 	settings = frappe.get_single("S3 Settings")
 	if not settings.bucket_name or not cint(settings.get("enable_backup_sync")):
+		return
+
+	# Uploading backups is still writing to the bucket, and a restored copy of a
+	# production database arrives with this switch already on — so a test site
+	# would start pushing its own dumps into production's storage the day after
+	# the restore, unasked.
+	if not environment.guard("upload backups", settings=settings):
 		return
 
 	try:

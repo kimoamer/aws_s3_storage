@@ -188,6 +188,12 @@ class S3File(File):
 		attachment, a record built straight from a URL) are left alone: there is
 		nothing to write, and the object they point at belongs to the record they
 		were copied from.
+
+		The same mechanism is what gives a restored copy of another site's database
+		its own files: there ``should_store_in_s3`` answers False for everything, so
+		an upload that Frappe deduplicated onto an inherited S3 object is written to
+		this site's local disk instead — a real, separate copy — and the object the
+		owning site is still serving is never touched.
 		"""
 		if self.get("is_folder") or self.flags.get("copy_from_existing_file"):
 			return
@@ -308,6 +314,11 @@ class S3File(File):
 		content_type = Image.MIME.get(image_format, "image/png")
 
 		thumbnail_url = s3_utils.upload_thumbnail(thumb_key, buffer.getvalue(), content_type)
+		if not thumbnail_url:
+			# Refused: this environment does not own the bucket (or it is read-only).
+			# The record keeps whatever thumbnail it already had — writing a URL for
+			# an object that was never uploaded would just produce a broken preview.
+			return None
 		if set_as_thumbnail:
 			self.db_set({"thumbnail_url": thumbnail_url, "s3_thumbnail_key": thumb_key})
 		return thumbnail_url

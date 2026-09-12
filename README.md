@@ -130,7 +130,7 @@ Open **S3 Settings** (a single doctype, System Manager only) and fill it in.
 
 | Field | Required | Description |
 | --- | --- | --- |
-| **Enable S3 Storage** | — | Master switch (on by default). When on, new uploads go to S3. When off — or before a bucket is configured — uploads fall back to Frappe's local storage instead of failing. Existing S3 files keep being served and deleted correctly either way. |
+| **Enable S3 Storage** | — | Master switch for *new uploads* (on by default). When on, new uploads go to S3. When off — or before a bucket is configured — uploads fall back to Frappe's local storage instead of failing. Existing S3 files keep being served, and turning it off never moves or pulls anything back out of the bucket. To stop the app modifying the bucket **at all** (deletes, privacy moves, the deletion queue, backup sync), use **Read-Only Mode** below. |
 | **Bucket Name** | Yes | The exact S3 bucket name. |
 | **Region** | Yes | The bucket's region code, e.g. `eu-central-1`. Must match the bucket's actual region — presigned URLs (SigV4) fail if it doesn't. |
 | **Access Key ID** | No | The IAM user's access key ID. **Leave blank on AWS to use the server's EC2 IAM role / instance profile** (recommended — no secret stored in the database). |
@@ -167,6 +167,24 @@ Open **S3 Settings** (a single doctype, System Manager only) and fill it in.
 > ⚠️ **Do not** use `DEEP_ARCHIVE` (or `GLACIER`) for user-facing attachments —
 > a presigned download would fail until the object is restored. These tiers only
 > make sense for cold data such as backups.
+
+#### Storage Ownership
+
+This section decides whether *this site* is allowed to change anything in the
+bucket. It is the answer to "we restored production onto a test server, and now
+the test server is deleting production's files" — see §9.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| **Read-Only Mode (Never Modify the Bucket)** | Off | One honest switch: files are still served from S3, but nothing in the bucket is created, moved or deleted from this site. Covers **every** path — uploads (they fall back to local disk), deletions, privacy moves, thumbnails, the deletion queue, backup sync, the migration jobs and the patches. |
+| **Storage Owner ID** | set automatically | Which environment owns this bucket. Written on install; the matching value is stored in `site_config.json`, which is *not* part of a database backup. That mismatch is how a restored copy is told apart from the original. Read-only. |
+| **Owner Site** | set automatically | The site name that claimed the bucket. Read-only. |
+| **Ownership Claimed At** | set automatically | When it was claimed. Read-only. |
+| **Files Owned by Another Environment** | `Read Only` | What this site may do to objects a *different* environment uploaded (File records carrying another owner id). Only relevant after you deliberately take ownership of a bucket that already holds someone else's files. Leave it on `Read Only`. |
+
+The form shows the current state as a banner, and **Test Connection** reports it
+too. The **Take Ownership of This Storage** button is under the *Storage
+Ownership* menu — read §9 before using it.
 
 #### Doctype Scope
 
@@ -850,6 +868,173 @@ describes it — and a delete usually removes both.
    **replication to a second account**.
 6. **Do the restore drill once** (§8.10) on a throwaway attachment. A recovery
    path you have never tested is not a backup.
+7. Add §9 before you clone the site anywhere: versioning makes a mistaken delete
+   *recoverable*, it does not stop a test copy from breaking live links.
+
+---
+
+### 9. Test / staging copies of a live site
+
+#### 9.1 The problem
+
+Restore a production database onto a test site and every `File` record comes
+with it — the same S3 keys, the same bucket name, the same credentials in **S3
+Settings**. Nothing *inside* the database distinguishes the two sites, so the
+test site is not working on a copy of the files. It is working on **the files**.
+
+| What you do on the test copy | What happens to production's files |
+| --- | --- |
+| Delete an attachment, or a document whose attachments cascade | The shared object is deleted once the test transaction commits |
+| Flip a file from public to private (or back) | The object is copied to the other prefix and the old key deleted — production still points at the old one |
+| Change the doctype scope, then save a file that is now out of scope | The object is downloaded to the test site's disk and the shared object deleted |
+| Let the hourly scheduler run | `S3 Deletion Queue` rows restored *from production* are executed from the test site |
+| Run `bench migrate` | Patches move attachments between storages and delete the originals |
+| Let the daily scheduler run | The test site starts pushing its own backups into production's bucket |
+
+Worse than any single case: the "is this object still used?" check before a
+delete only queries **the database it is running in**. The test site cannot see
+that production is still serving the attachment, so it concludes the delete is
+safe.
+
+A checkbox cannot fix this, because a checkbox lives in the database and is
+copied along with it: the flag that says "this is production" arrives on the test
+site saying exactly the same thing.
+
+#### 9.2 How the app tells the two apart
+
+Ownership is a match between two values kept in **different places**:
+
+- `storage_owner_id` in **S3 Settings** — inside the database, so it travels with
+  a restore;
+- the same id under `aws_s3_storage_owner` in **`site_config.json`** — a file on
+  disk. `bench backup` does not put it in the dump and `bench restore` does not
+  write it, so it stays behind.
+
+They agree only on the site that claimed the bucket:
+
+| Situation | Database / on disk | State |
+| --- | --- | --- |
+| Fresh install | none / none | `unclaimed` |
+| The site that claimed the bucket | `X` / `X` | **owner** |
+| Production's database restored onto test | `X` / none | **foreign** |
+| Restored over a site that had claimed its own bucket | `X` / `Y` | **foreign** |
+| Production restored onto itself (a normal recovery) | `X` / `X` | **owner** |
+| The whole site directory copied, `site_config.json` included | `X` / `X` | **foreign** — caught by the recorded site name |
+
+The claim happens automatically in `after_install` / `after_migrate`, and **only
+from the `unclaimed` state**. A restored database already carries an owner id, so
+running `bench migrate` on the test site can never make it the owner by accident
+— it prints the mismatch instead.
+
+> ⚠️ **Upgrade the live site first.** A database from a version that predates
+> this field carries no owner id at all, so it is `unclaimed` wherever it lands
+> and the first site to run `bench migrate` on this version claims the bucket. Do
+> that on production before you clone it anywhere. From then on, every copy of
+> its database is detected.
+
+#### 9.3 What a foreign environment can and cannot do
+
+| Operation | On the owner | On a restored copy |
+| --- | --- | --- |
+| Read / download an inherited attachment | Yes | Yes (see 9.4 — restrict this with IAM, not with app settings) |
+| Upload a new file | Goes to S3 | Goes to **the test site's own local disk** |
+| Delete an attachment inherited from production | Normal delete policy (§8) | The `File` record goes, **the object stays** |
+| Change a file's privacy, or move it between storages | Normal | Refused — the record keeps pointing at the object where it is |
+| Generate a thumbnail for an inherited file | Normal | Refused — no object is written |
+| Execute a deletion request inherited from a backup | Retried normally | Parked as `Blocked` in **S3 Deletion Queue** |
+| Run the migration / scope moves / patches | Normal | Refused, with the reason recorded |
+| Daily backup sync | Normal | Refused |
+
+Nothing is refused silently: every refusal is logged, and an interactive action
+shows *S3 storage was not modified: …* with the reason.
+
+Upload behaviour is the part that keeps the test site usable. A new upload on a
+foreign site goes to its own disk, and an upload that Frappe deduplicates onto an
+*inherited* object is written out as a real, separate local copy — so editing a
+file on the test copy never edits production's.
+
+#### 9.4 The layer the app cannot enforce: credentials
+
+The checks above live in the application. They stop *this app* from modifying the
+bucket — they cannot stop a `bench execute`, another app, or a shell with the same
+credentials. Treat them as the second line, not the first:
+
+**Give the test environment its own credentials, read-only on the production
+bucket.** Set `access_key_id` / `secret_access_key` in the test site's **S3
+Settings** to an IAM user whose policy allows only `s3:GetObject` (plus
+`s3:ListBucket` if you need it) and denies `s3:PutObject` and `s3:DeleteObject`.
+A mistake then fails at AWS, not at a Python `if`.
+
+```json
+{
+  "Sid": "TestCopyIsReadOnly",
+  "Effect": "Deny",
+  "Action": ["s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion", "s3:CopyObject"],
+  "Resource": "arn:aws:s3:::PRODUCTION_BUCKET/*"
+}
+```
+
+#### 9.5 Checklist: restoring production onto a test site
+
+1. **Restore the database.** Do *not* copy `site_config.json` across — that file
+   is what identifies the environment.
+2. **Open S3 Settings.** The banner should read *"This site does not own the
+   configured storage."* If it does not, stop: the two sites are not being told
+   apart, and nothing below will help.
+3. **Swap in read-only credentials** for the production bucket (9.4), or clear
+   the bucket name entirely if the test site does not need to see the files.
+4. **Park inherited deletion requests** — the *Park N Inherited Deletion(s)*
+   button, or `bench execute aws_s3_storage.aws_s3_storage.environment.block_inherited_deletions`.
+   They are requests production made, against a database this site cannot vouch
+   for.
+5. Optionally turn on **Read-Only Mode** as a belt-and-braces switch.
+6. If the test site should have real S3 storage of its own: point **Bucket Name**
+   at a *different* bucket, then use **Take Ownership of This Storage**. It
+   becomes a normal owner — of that bucket.
+
+#### 9.6 Taking ownership deliberately
+
+**Take Ownership of This Storage** (S3 Settings → *Storage Ownership*) makes this
+site the owner of the bucket it is currently pointed at. Use it when:
+
+- you moved production to a new server and the new site must own the bucket;
+- you gave a test/staging site its own bucket (point it there **first**);
+- the state says `unclaimed` and you want it recorded now.
+
+Do **not** use it to "make the warning go away" on a copy that shares a bucket
+with a live site — that is precisely the mistake this exists to prevent.
+
+The dialog offers *Also tag existing S3 files as owned by this site*. It stamps
+every S3-backed `File` that has no recorded owner (everything uploaded before
+this field existed) with this environment's id, so that a site which later adopts
+the same bucket is still kept away from them. Tick it on the site that genuinely
+owns the bucket; leave it off if the bucket holds another environment's files.
+
+#### 9.7 Two related cases
+
+- **Restoring an old backup onto production.** The database goes back in time;
+  the bucket does not. Records return that point at objects deleted since, and
+  objects uploaded after the backup date are left with no record. Ownership is
+  unaffected (the id is in the dump and on disk, and they still match), so the
+  app keeps working — but audit before you trust the links: `bench execute
+  aws_s3_storage.aws_s3_storage.migrate.audit_local_links` for local links, and
+  the `S3 Deletion Queue` for requests the restore brought back.
+- **Running the old and new server at once during a move.** Both point at the
+  same bucket, and only one of them can be the owner — the other one's
+  scheduled jobs stand down instead of racing it. Claim the bucket on the new
+  server only once the old one is out of service.
+
+#### 9.8 What is still on your side
+
+The checks above cover this app's own code paths. They do not cover:
+
+- another app, a `bench execute`, or a shell with the same credentials — use
+  9.4 for that;
+- links embedded in rich text, HTML fields and Print Formats (see §6, *Audit
+  Local Links*): those are not `File` records and are not repointed;
+- a bucket or endpoint change: files do not record which storage they came from,
+  so pointing the site at a different bucket changes where every existing key is
+  read from, without moving anything.
 
 ---
 

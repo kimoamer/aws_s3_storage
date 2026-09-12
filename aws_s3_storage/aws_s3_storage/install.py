@@ -4,6 +4,8 @@
 import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
+from aws_s3_storage.aws_s3_storage import environment
+
 # Object keys can be long ("public/<uuid>/<filename>"), so the columns are wider
 # than the default Data length (140) to avoid "Data too long for column 's3_key'".
 S3_KEY_LENGTH = 500
@@ -35,6 +37,22 @@ FILE_CUSTOM_FIELDS = {
 			"search_index": 1,
 			"insert_after": "s3_key",
 		},
+		{
+			# Which environment put this object in the bucket. Empty means "unknown"
+			# (every file uploaded before this field existed), which the owning
+			# environment is allowed to modify; a *different* environment's id is what
+			# keeps a site that has adopted a shared bucket away from files it did not
+			# create. See aws_s3_storage/environment.py.
+			"fieldname": "s3_owner",
+			"label": "S3 Storage Owner",
+			"fieldtype": "Data",
+			"length": 64,
+			"read_only": 1,
+			"hidden": 1,
+			"no_copy": 1,
+			"search_index": 1,
+			"insert_after": "s3_thumbnail_key",
+		},
 	]
 }
 
@@ -51,6 +69,11 @@ def after_migrate():
 def _setup():
 	create_custom_fields(FILE_CUSTOM_FIELDS, ignore_validate=True)
 	_ensure_key_column_length()
+	# Record this environment as the owner of the bucket — but only if nobody has
+	# claimed it yet. A database restored from another site arrives with an owner
+	# id already in it, so this never transfers ownership by accident; it reports
+	# the mismatch instead. See aws_s3_storage/environment.py.
+	environment.claim_if_unclaimed()
 
 
 def _ensure_key_column_length():

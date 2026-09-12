@@ -14,7 +14,7 @@ from botocore.exceptions import ClientError
 from frappe.core.doctype.file.file import File
 from frappe.tests.utils import FrappeTestCase
 
-from aws_s3_storage.aws_s3_storage import s3_utils
+from aws_s3_storage.aws_s3_storage import environment, s3_utils
 
 
 class TestS3Settings(FrappeTestCase):
@@ -30,6 +30,14 @@ class TestS3Settings(FrappeTestCase):
 		frappe.db.set_single_value("S3 Settings", "restrict_to_doctypes", 0)
 		frappe.db.set_single_value("S3 Settings", "scoped_doctypes", "")
 		frappe.db.set_single_value("S3 Settings", "include_unattached_files", 0)
+		frappe.db.set_single_value("S3 Settings", "enabled", 1)
+		frappe.db.set_single_value("S3 Settings", "read_only_mode", 0)
+		frappe.db.set_single_value("S3 Settings", "inherited_storage_policy", environment.POLICY_READ_ONLY)
+		# Match whatever this site actually recorded on disk, so the ownership check
+		# lands on "owner" (or "unclaimed" if the install never claimed) rather than
+		# depending on how the test site was created.
+		frappe.db.set_single_value("S3 Settings", "storage_owner_id", environment.local_owner_id())
+		frappe.db.set_single_value("S3 Settings", "storage_owner_site", environment.current_site())
 
 	# --- helpers -----------------------------------------------------------
 
@@ -41,6 +49,48 @@ class TestS3Settings(FrappeTestCase):
 			yield
 		finally:
 			frappe.session.user = original
+
+	@contextmanager
+	def _environment(self, db_owner, disk_owner, owner_site=None):
+		"""Force the two halves of the ownership check together or apart.
+
+		``db_owner`` is what a restored database carries; ``disk_owner`` is what
+		site_config.json on this server says. They only agree on the site that
+		claimed the bucket — which is exactly what the guard relies on.
+		"""
+		key = environment.OWNER_CONFIG_KEY
+		had, previous = key in frappe.conf, frappe.conf.get(key)
+		before = {
+			field: frappe.db.get_single_value("S3 Settings", field) or ""
+			for field in ("storage_owner_id", "storage_owner_site")
+		}
+
+		if disk_owner is None:
+			frappe.conf.pop(key, None)
+		else:
+			frappe.conf[key] = disk_owner
+		frappe.db.set_single_value("S3 Settings", "storage_owner_id", db_owner or "")
+		frappe.db.set_single_value(
+			"S3 Settings",
+			"storage_owner_site",
+			environment.current_site() if owner_site is None else owner_site,
+		)
+		try:
+			yield
+		finally:
+			if had:
+				frappe.conf[key] = previous
+			else:
+				frappe.conf.pop(key, None)
+			for field, value in before.items():
+				frappe.db.set_single_value("S3 Settings", field, value)
+
+	def _restored_copy(self):
+		"""A production database restored onto a site that never claimed the bucket."""
+		return self._environment(db_owner="prod-environment", disk_owner=None)
+
+	def _owner_site(self):
+		return self._environment(db_owner="this-environment", disk_owner="this-environment")
 
 	@contextmanager
 	def _file_doc(self, file_doc):
@@ -1323,3 +1373,281 @@ class TestS3Settings(FrappeTestCase):
 		s3 = MagicMock()
 		s3.head_object.side_effect = ClientError({"Error": {"Code": "404"}}, "HeadObject")
 		self.assertFalse(s3_utils.object_exists("k", s3=s3, bucket="b"))
+
+	# --- storage ownership -------------------------------------------------
+	# A copy of this database must not be able to modify the original's files.
+	# The scenario throughout: a production database is restored onto a test site.
+	# Every File record, every S3 key and the bucket configuration come with it,
+	# so nothing inside the database distinguishes the two sites. Ownership is
+	# decided by a value that is *not* in the database (site_config.json), which
+	# is why the test site can be told apart at all.
+
+	def test_a_fresh_install_is_unclaimed(self):
+		with self._environment(db_owner="", disk_owner=None):
+			self.assertEqual(environment.state(), environment.UNCLAIMED)
+		# Unclaimed is permissive: nothing here says the database was moved.
+		with self._environment(db_owner="", disk_owner=None):
+			self.assertTrue(environment.may_modify_storage())
+
+	def test_the_site_that_claimed_the_bucket_owns_it(self):
+		with self._owner_site():
+			self.assertEqual(environment.state(), environment.OWNER)
+			self.assertTrue(environment.may_modify_storage())
+
+	def test_a_restored_database_is_foreign(self):
+		with self._restored_copy():
+			info = environment.ownership()
+			self.assertEqual(info.state, environment.FOREIGN)
+			self.assertIn("restored here", info.reason)
+			self.assertFalse(environment.may_modify_storage())
+
+	def test_a_restore_over_a_site_that_claimed_its_own_bucket_is_foreign(self):
+		with self._environment(db_owner="prod-environment", disk_owner="test-environment"):
+			info = environment.ownership()
+			self.assertEqual(info.state, environment.FOREIGN)
+			self.assertIn("different environments", info.reason)
+
+	def test_a_whole_site_copy_is_caught_by_the_site_name(self):
+		# site_config.json travelled too, so the ids agree — the site it now answers
+		# to is the only thing left that tells the copy from the original.
+		with self._environment(db_owner="same-id", disk_owner="same-id", owner_site="prod.example.com"):
+			info = environment.ownership()
+			self.assertEqual(info.state, environment.FOREIGN)
+			self.assertIn("looks like a copy", info.reason)
+
+	def test_migrate_never_transfers_ownership_to_a_restored_copy(self):
+		# bench migrate runs after_migrate -> claim_if_unclaimed on every site,
+		# including the test copy. It must leave the recorded owner alone.
+		with self._restored_copy():
+			environment.claim_if_unclaimed()
+			self.assertEqual(environment.recorded_owner_id(), "prod-environment")
+			self.assertEqual(environment.state(), environment.FOREIGN)
+
+	# --- read-only mode ----------------------------------------------------
+
+	def test_read_only_mode_blocks_the_owner_too(self):
+		with self._owner_site():
+			frappe.db.set_single_value("S3 Settings", "read_only_mode", 1)
+			self.assertEqual(environment.state(), environment.OWNER)
+			self.assertFalse(environment.may_modify_storage())
+			self.assertIn("Read-Only Mode", environment.blocked_reason())
+
+	# --- per-file ownership ------------------------------------------------
+
+	def test_a_file_with_no_recorded_owner_may_be_modified(self):
+		with self._owner_site():
+			self.assertTrue(environment.may_modify_object(frappe._dict()))
+			self.assertTrue(environment.may_modify_object(frappe._dict(s3_owner="")))
+
+	def test_a_file_owned_by_another_environment_is_left_alone(self):
+		with self._owner_site():
+			self.assertTrue(environment.may_modify_object(frappe._dict(s3_owner="this-environment")))
+			self.assertFalse(environment.may_modify_object(frappe._dict(s3_owner="somebody-else")))
+
+	def test_full_access_policy_overrides_per_file_ownership(self):
+		with self._owner_site():
+			frappe.db.set_single_value(
+				"S3 Settings", "inherited_storage_policy", environment.POLICY_FULL_ACCESS
+			)
+			self.assertTrue(environment.may_modify_object(frappe._dict(s3_owner="somebody-else")))
+
+	def test_full_access_policy_does_not_override_the_environment(self):
+		# The escape hatch is for files, not for being the wrong environment.
+		with self._restored_copy():
+			frappe.db.set_single_value(
+				"S3 Settings", "inherited_storage_policy", environment.POLICY_FULL_ACCESS
+			)
+			self.assertFalse(environment.may_modify_object(frappe._dict(s3_owner="prod-environment")))
+
+	# --- uploads -----------------------------------------------------------
+
+	def test_a_restored_copy_uploads_to_its_own_disk(self):
+		with self._restored_copy():
+			self.assertFalse(s3_utils.should_store_in_s3(frappe._dict(attached_to_doctype="Sales Invoice")))
+			with (
+				patch.object(s3_utils, "get_s3_client") as client,
+				patch.object(
+					s3_utils, "_save_to_filesystem", return_value={"file_url": "/files/x"}
+				) as fallback,
+			):
+				result = s3_utils.write_file_to_s3("x.txt", b"data")
+
+		client.assert_not_called()
+		fallback.assert_called_once()
+		self.assertEqual(result, {"file_url": "/files/x"})
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_an_upload_records_the_environment_that_made_it(self, mock_get_client):
+		mock_get_client.return_value = MagicMock()
+		with self._owner_site():
+			result = s3_utils.write_file_to_s3("x.txt", b"data")
+		self.assertEqual(result["s3_owner"], "this-environment")
+
+	# --- deletion ----------------------------------------------------------
+
+	def test_a_restored_copy_unlinks_but_never_deletes(self):
+		doc = frappe._dict(s3_key="private/uid/report.pdf", file_url="/x", thumbnail_url=None)
+		with self._restored_copy(), patch.object(s3_utils, "_delete_after_commit") as scheduled:
+			s3_utils.delete_file_from_s3(doc)
+		scheduled.assert_not_called()
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_the_delete_primitive_refuses_on_a_restored_copy(self, mock_get_client):
+		# Callers check first, but _delete_keys runs from after_commit callbacks and
+		# background jobs, so the one place that issues delete_object checks again.
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+		with self._restored_copy():
+			s3_utils._delete_keys("bucket", ["private/uid/report.pdf"])
+		s3.delete_object.assert_not_called()
+
+	def test_a_file_owned_by_another_environment_is_never_deleted(self):
+		doc = frappe._dict(s3_key="private/uid/report.pdf", s3_owner="prod-environment", file_url="/x")
+		with self._owner_site(), patch.object(s3_utils, "_delete_after_commit") as scheduled:
+			s3_utils.delete_file_from_s3(doc)
+		scheduled.assert_not_called()
+
+	# --- privacy / thumbnails ----------------------------------------------
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_a_privacy_change_does_not_move_another_environments_object(self, mock_get_client):
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+		key = "public/uid/logo.png"
+		doc = frappe._dict(s3_key=key, file_url=s3_utils._build_file_url(key), is_private=1)
+
+		with self._restored_copy():
+			s3_utils.move_object_privacy(doc)
+
+		s3.copy_object.assert_not_called()
+		# The record still points at the object exactly where it is.
+		self.assertEqual(doc.s3_key, key)
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_no_thumbnail_is_written_into_another_environments_bucket(self, mock_get_client):
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+		with self._restored_copy():
+			self.assertIsNone(s3_utils.upload_thumbnail("public/uid/t_small.png", b"x", "image/png"))
+		s3.put_object.assert_not_called()
+
+	# --- the deletion queue ------------------------------------------------
+
+	def _queue_row(self, key, bucket="test-bucket"):
+		doc = frappe.get_doc(
+			{"doctype": "S3 Deletion Queue", "s3_key": key, "bucket": bucket, "status": "Pending"}
+		).insert(ignore_permissions=True)
+		self.addCleanup(
+			lambda: (
+				frappe.db.exists("S3 Deletion Queue", doc.name)
+				and frappe.delete_doc("S3 Deletion Queue", doc.name, force=True, ignore_permissions=True)
+			)
+		)
+		return doc
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_inherited_deletion_requests_are_parked_not_executed(self, mock_get_client):
+		row = self._queue_row("private/inherited/report.pdf")
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+
+		with self._restored_copy(), patch.object(frappe.db, "commit"):
+			s3_utils.process_deletion_queue()
+
+		s3.delete_object.assert_not_called()
+		self.assertEqual(frappe.db.get_value("S3 Deletion Queue", row.name, "status"), "Blocked")
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_a_request_queued_against_another_bucket_is_parked(self, mock_get_client):
+		row = self._queue_row("private/uid/old.pdf", bucket="some-other-bucket")
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+
+		with self._owner_site(), patch.object(frappe.db, "commit"):
+			s3_utils.process_deletion_queue()
+
+		s3.delete_object.assert_not_called()
+		self.assertEqual(frappe.db.get_value("S3 Deletion Queue", row.name, "status"), "Blocked")
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_the_queue_rechecks_references_before_retrying(self, mock_get_client):
+		# The first attempt failed some time ago; by now the object is in use again.
+		row = self._queue_row("private/uid/report.pdf")
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+
+		with (
+			self._owner_site(),
+			patch.object(s3_utils, "_key_is_referenced", return_value=True),
+			patch.object(frappe.db, "commit"),
+		):
+			s3_utils.process_deletion_queue()
+
+		s3.delete_object.assert_not_called()
+		self.assertFalse(frappe.db.exists("S3 Deletion Queue", row.name))
+
+	# --- backups, migration, scope moves -----------------------------------
+
+	def test_backup_sync_does_not_run_from_a_restored_copy(self):
+		frappe.db.set_single_value("S3 Settings", "enable_backup_sync", 1)
+		with self._restored_copy(), patch.object(s3_utils, "get_s3_client") as client:
+			s3_utils.sync_backups_to_s3()
+		client.assert_not_called()
+
+	def test_migration_refuses_to_start_from_a_restored_copy(self):
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		frappe.db.set_single_value("S3 Migration Status", "status", "Idle")
+		with self._restored_copy():
+			with self.assertRaises(frappe.ValidationError) as caught:
+				migrate.start_migration()
+		self.assertIn("Cannot migrate files into S3", str(caught.exception))
+
+	def test_migrate_file_skips_on_a_restored_copy(self):
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		doc = frappe._dict(name="F1", is_folder=0, file_url="/private/files/a.pdf", s3_key=None)
+		with self._restored_copy(), self._file_doc(doc):
+			self.assertEqual(migrate.migrate_file("F1"), "skipped")
+
+	def test_a_restored_copy_never_moves_a_file_out_of_s3(self):
+		from aws_s3_storage.aws_s3_storage import migrate
+
+		key = "private/uid/report.pdf"
+		row = frappe._dict(name="F1", s3_key=key, file_url=s3_utils._build_file_url(key))
+		with self._restored_copy(), patch.object(s3_utils, "read_file_from_s3") as read:
+			self.assertIsNone(migrate.move_file_to_disk(row))
+		read.assert_not_called()
+
+	def test_scope_moves_stand_down_on_a_restored_copy(self):
+		self._restrict_to("Sales Invoice")
+		key = "private/uid/report.pdf"
+		with self._restored_copy():
+			jobs = self._reevaluate(
+				file_url=s3_utils._build_file_url(key), s3_key=key, attached_to_doctype="Lead"
+			)
+		self.assertEqual(jobs, [])
+
+	def test_disabling_the_integration_never_pulls_files_out_of_s3(self):
+		"""Turning "Enable S3 Storage" off must stop the integration, not start a move.
+
+		With a doctype scope configured, should_store_in_s3() answers False for
+		every file once the switch is off — which used to read as "this file belongs
+		on local disk", download the object and delete it. The switch an
+		administrator reaches for to *stop* the integration was the one that started
+		moving files.
+		"""
+		self._restrict_to("Sales Invoice")
+		key = "private/uid/report.pdf"
+		s3_url = s3_utils._build_file_url(key)
+
+		# Still on: an out-of-scope file is genuinely out of place, so it moves.
+		self.assertEqual(len(self._reevaluate(file_url=s3_url, s3_key=key, attached_to_doctype="Lead")), 1)
+
+		frappe.db.set_single_value("S3 Settings", "enabled", 0)
+		# Off: nothing moves, in either direction.
+		self.assertEqual(self._reevaluate(file_url=s3_url, s3_key=key, attached_to_doctype="Lead"), [])
+		self.assertEqual(
+			self._reevaluate(file_url=s3_url, s3_key=key, attached_to_doctype="Sales Invoice"), []
+		)
+		self.assertEqual(self._reevaluate(file_url="/files/a.pdf", attached_to_doctype="Sales Invoice"), [])

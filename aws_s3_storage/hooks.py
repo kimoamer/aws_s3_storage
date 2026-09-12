@@ -163,7 +163,10 @@ write_file = "aws_s3_storage.aws_s3_storage.s3_utils.write_file_to_s3"
 delete_file_data_content = "aws_s3_storage.aws_s3_storage.s3_utils.delete_file_from_s3"
 # s3_key/s3_thumbnail_key are included so that when Frappe reuses an existing file
 # for a duplicate content hash, the new File record inherits the canonical keys.
-write_file_keys = ["file_name", "file_url", "file_size", "s3_key", "s3_thumbnail_key"]
+# s3_owner rides along for the same reason: a record that inherits an object must
+# also inherit which environment owns it, or the guard would read it as "unknown"
+# and let a site that adopted the bucket modify another site's file.
+write_file_keys = ["file_name", "file_url", "file_size", "s3_key", "s3_thumbnail_key", "s3_owner"]
 
 # Testing
 # -------

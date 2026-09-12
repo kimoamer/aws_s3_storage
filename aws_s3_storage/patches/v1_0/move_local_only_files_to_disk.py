@@ -19,7 +19,7 @@ Idempotent — a second run finds nothing left to move.
 
 import frappe
 
-from aws_s3_storage.aws_s3_storage import migrate, s3_utils
+from aws_s3_storage.aws_s3_storage import environment, migrate, s3_utils
 
 
 def execute():
@@ -31,10 +31,21 @@ def execute():
 	if not settings.bucket_name:
 		return
 
-	moved = failed = 0
+	# Downloading every object and rewriting its record is a migration in its own
+	# right, and on a restored copy of another site's database those records (and
+	# objects) belong to that site. bench migrate runs patches automatically, so
+	# without this a routine migrate on a test site would start reshuffling
+	# production's attachments.
+	if not environment.may_modify_storage(settings):
+		print(f"aws_s3_storage: skipping local-only file move — {environment.blocked_reason(settings)}")
+		return
+
+	moved = failed = skipped = 0
 	for row in _s3_backed_local_only_files():
 		try:
-			migrate.move_file_to_disk(row)
+			if migrate.move_file_to_disk(row) is None:
+				skipped += 1
+				continue
 			frappe.db.commit()
 			moved += 1
 		except Exception as e:
@@ -44,8 +55,11 @@ def execute():
 			frappe.logger().error(f"aws_s3_storage: could not move File {row.name} to disk: {e}")
 			print(f"aws_s3_storage: could not move File {row.name} ({row.file_url}) to disk: {e}")
 
-	if moved or failed:
-		print(f"aws_s3_storage: moved {moved} attachment(s) back to local disk, {failed} failed")
+	if moved or failed or skipped:
+		print(
+			f"aws_s3_storage: moved {moved} attachment(s) back to local disk, "
+			f"{failed} failed, {skipped} skipped"
+		)
 
 
 def _s3_backed_local_only_files():

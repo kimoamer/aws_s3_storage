@@ -32,7 +32,7 @@ import time
 import frappe
 from frappe.utils import cint, now_datetime
 
-from aws_s3_storage.aws_s3_storage import s3_utils
+from aws_s3_storage.aws_s3_storage import environment, s3_utils
 
 STATUS_DOCTYPE = "S3 Migration Status"
 ERROR_DOCTYPE = "S3 Migration Error"
@@ -200,6 +200,7 @@ def start_migration(batch_size=100, delete_local=0):
 	frappe.only_for("System Manager")
 	if _migration_active():
 		frappe.throw("A migration is already running.")
+	_require_storage_ownership()
 
 	_set_status(
 		status="Queued",
@@ -217,6 +218,18 @@ def start_migration(batch_size=100, delete_local=0):
 	_clear_errors()
 	_enqueue_run(cint(batch_size), cint(delete_local), _TIME_BUDGET_SECONDS)
 	return get_migration_status()
+
+
+def _require_storage_ownership(settings=None):
+	"""Refuse to start a migration from an environment that does not own the bucket.
+
+	A migration uploads objects, repoints records at them and (optionally) deletes
+	the local originals. Every one of those is a write, and on a restored copy of
+	another site's database the records being repointed belong to that site.
+	"""
+	settings = settings if settings is not None else frappe.get_single("S3 Settings")
+	if not environment.may_modify_storage(settings):
+		frappe.throw(f"Cannot migrate files into S3: {environment.blocked_reason(settings)}")
 
 
 def _enqueue_run(batch_size, delete_local, time_budget):
@@ -258,6 +271,16 @@ def run_migration(batch_size=100, delete_local=0, time_budget=0, max_files=0, re
 	max_files = cint(max_files)
 	reset = cint(reset)
 
+	# A chained or scheduled job can outlive the state it was queued in, and a job
+	# that raised here would leave the status stuck on "Queued" with nothing to
+	# explain it. Record the reason and stop.
+	settings = frappe.get_single("S3 Settings")
+	if not environment.may_modify_storage(settings):
+		reason = environment.blocked_reason(settings)
+		environment.report_blocked("migrate files into S3", settings=settings)
+		_set_status(status="Failed", finished_at=now_datetime(), error_message=reason)
+		return _read_totals()
+
 	status = frappe.db.get_single_value(STATUS_DOCTYPE, "status")
 	if reset and status not in ("Running", "Queued"):
 		# Fresh standalone run (console, or first invocation): reset counters.
@@ -291,9 +314,8 @@ def run_migration(batch_size=100, delete_local=0, time_budget=0, max_files=0, re
 	started = time.monotonic()
 	processed_this_job = 0
 
-	# Reuse one S3 client + settings for the whole job instead of rebuilding them
-	# per file — matters a lot at tens of thousands of files.
-	settings = frappe.get_single("S3 Settings")
+	# Reuse one S3 client for the whole job instead of rebuilding it per file —
+	# matters a lot at tens of thousands of files. (``settings`` was read above.)
 	s3 = s3_utils.get_s3_client()
 
 	def _stop():
@@ -363,6 +385,11 @@ def scheduled_migration():
 		return
 	if not cint(settings.get("enabled")) or not settings.bucket_name:
 		return
+	# A restored copy of a production database arrives with this scheduler already
+	# enabled, so the guard has to be here and not only on the manual button.
+	if not environment.may_modify_storage(settings):
+		environment.report_blocked("run the scheduled migration", settings=settings)
+		return
 	if _migration_active():
 		return
 
@@ -388,6 +415,10 @@ def migrate_file(name, delete_local=0, s3=None, settings=None):
 		return "skipped"
 
 	settings = settings or frappe.get_single("S3 Settings")
+
+	if not environment.may_modify_storage(settings):
+		environment.report_blocked("migrate a file into S3", detail=name, settings=settings)
+		return "skipped"
 
 	# Doctypes the admin kept out of S3 stay on disk. Checked here as well as in the
 	# pending query, so a direct call (bench execute) cannot move a file the scope
@@ -415,7 +446,11 @@ def migrate_file(name, delete_local=0, s3=None, settings=None):
 	if not s3_utils.object_exists(new_key, expected_size=local_size, s3=s3, bucket=bucket):
 		raise RuntimeError(f"Upload verification failed for {new_key}")
 
-	update = {"file_url": s3_utils._build_file_url(new_key), "s3_key": new_key}
+	update = {
+		"file_url": s3_utils._build_file_url(new_key),
+		"s3_key": new_key,
+		"s3_owner": environment.owner_stamp(settings),
+	}
 
 	# Migrate a local thumbnail too, if any.
 	old_thumb_url = None
@@ -538,6 +573,14 @@ def move_file_to_disk(row):
 	not the attachment.
 	"""
 	key = row.get("s3_key") or s3_utils._extract_key(row.get("file_url"))
+
+	# Moving a file back to disk unhooks the record from its object and then drops
+	# the object. On a copy of another site's database that object is still live
+	# for the site that owns it, and the record being rewritten is that site's
+	# record — so this stands down entirely rather than doing half of it.
+	if not environment.guard("move a file out of S3", file_doc=row):
+		return None
+
 	content = s3_utils.read_file_from_s3(key)
 
 	file_name, file_url = _write_local_copy(row, content)
@@ -605,6 +648,19 @@ def reevaluate_scope(doc, method=None):
 	if not settings.bucket_name:
 		return
 
+	# Two ways this would otherwise fire on a site that wants nothing to happen.
+	#
+	# "Enable S3 Storage" off: should_store_in_s3() then answers False for every
+	# file, so with a doctype scope configured, saving an S3-backed file would look
+	# like "this belongs on local disk", pull the object down and delete it. The
+	# switch an administrator reaches for to *stop* the integration would be the
+	# thing that starts moving files. Off means leave the bucket alone.
+	#
+	# A foreign environment: same answer, same consequence, against objects it does
+	# not own.
+	if not s3_utils._is_enabled(settings) or not environment.may_modify_storage(settings):
+		return
+
 	in_s3 = bool(doc.get("s3_key") or s3_utils._extract_key(doc.get("file_url")))
 	if in_s3 == s3_utils.should_store_in_s3(doc, settings=settings):
 		return
@@ -633,6 +689,10 @@ def move_file_for_scope(file_name):
 
 	settings = frappe.get_single("S3 Settings")
 	if not s3_utils.is_scope_restricted(settings) or not settings.bucket_name:
+		return
+	# Re-checked here as well: the job runs after commit, and the settings (or the
+	# environment) may have changed since it was queued.
+	if not s3_utils._is_enabled(settings) or not environment.may_modify_storage(settings):
 		return
 
 	doc = frappe.get_doc("File", file_name)
