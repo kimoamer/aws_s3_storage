@@ -1119,11 +1119,18 @@ def process_deletion_queue():
 		# the bucket does not retroactively make its judgement ours. This is what
 		# stops a restored copy that has adopted the bucket from executing the
 		# backlog it inherited.
+		#
+		# A row with no environment at all is parked for the same reason: rows
+		# written before this column existed cannot be attributed, and "we do not
+		# know who asked for this deletion" is not permission to carry it out. An
+		# administrator adopts them deliberately (adopt_unattributed_deletions).
 		requested_by = (row.requested_by_environment or "").strip()
-		if requested_by and requested_by != owner_id:
+		if requested_by != owner_id:
 			_park_deletion(
 				row.name,
-				f"Blocked: queued by environment '{requested_by}', which is not this one.",
+				f"Blocked: queued by environment '{requested_by}', which is not this one."
+				if requested_by
+				else "Blocked: this request records no environment, so it cannot be attributed.",
 			)
 			continue
 

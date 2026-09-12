@@ -155,7 +155,15 @@ scheduler_events = {
 		"aws_s3_storage.aws_s3_storage.s3_utils.sync_backups_to_s3",
 		"aws_s3_storage.aws_s3_storage.migrate.scheduled_migration",
 	],
-	"hourly": ["aws_s3_storage.aws_s3_storage.s3_utils.process_deletion_queue"],
+	"hourly": [
+		"aws_s3_storage.aws_s3_storage.s3_utils.process_deletion_queue",
+		# Keeps the owner's lease in the bucket visibly current. Nothing is granted
+		# or withdrawn on a heartbeat's age (see environment.py) — it exists so an
+		# administrator deciding whether the other server is really gone is looking
+		# at "last seen 40 minutes ago" rather than a date from whenever that site
+		# last happened to delete something.
+		"aws_s3_storage.aws_s3_storage.environment.heartbeat",
+	],
 }
 
 # AWS S3 Integration Hooks

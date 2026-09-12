@@ -881,6 +881,13 @@ describes it — and a delete usually removes both.
 
 ### 9. Test / staging copies of a live site
 
+> **Read 9.5 first.** The checks in this section run inside the application, and
+> the application is not what holds the credentials. **Separate, read-only
+> credentials for the test environment are the primary protection**; everything
+> else here is a second line that catches the mistakes those credentials would
+> not — and that stops the app doing damage in the window before anyone thinks
+> to set them up. Do not treat this section as a substitute for 9.5.
+
 #### 9.1 The problem
 
 Restore a production database onto a test site and every `File` record comes
@@ -953,23 +960,63 @@ three were copied. Two environments then both believe they are the owner, and
 neither can see the other — nothing they compare lives anywhere they share.
 
 The bucket is the thing they share. `.aws_s3_storage/owner.json` names the
-server that currently holds ownership and carries a heartbeat. Before anything
-**destructive** — deleting an object, replacing one (a privacy move, a
-regenerated thumbnail), moving a file out of S3, running the deletion queue —
-the app checks that the lease still names it:
+server that currently holds ownership. Before anything **destructive** —
+deleting an object, replacing one (a privacy move, a regenerated thumbnail),
+moving a file out of S3, running the deletion queue — the app checks that the
+lease still names it:
 
 | Lease says | Result |
 | --- | --- |
-| This server | Proceed; refresh the heartbeat |
-| A server not heard from for an hour | Take it over — the previous holder is gone (a rename, a rebuilt container, a finished move). Heals itself |
-| A **live** server, same owner id | **Conflict.** Two servers are running this site against one bucket. Stand down here, and say so in red on the S3 Settings form |
+| This server | Proceed |
+| Any other server, **at any age** | **Conflict.** Stand down, and say so in red on the S3 Settings form |
 | A different owner id entirely | **Conflict.** Two environments are pointed at one bucket |
+| Missing, and this site is the recorded owner | Create it, conditionally (`If-None-Match: *`) so a simultaneous create elsewhere cannot also succeed |
 | Unreadable (no access, S3 down) | **Unverified.** Destructive work waits; uploads carry on, because a failed delete is queued and nothing is lost, while a blocked upload would silently scatter files onto local disk |
 
-The lease is read at most once per worker per 10 minutes and only on the
-destructive path, so uploads never pay for it. It needs `s3:GetObject` and
-`s3:PutObject` on `.aws_s3_storage/*`, which the bucket-wide policy in §1.2
-already grants.
+##### Ownership never moves on its own
+
+There is deliberately **no timeout** by which one server takes the lease from
+another. The reason is worth stating, because a timeout looks obviously
+sensible and is the single most dangerous thing that could be added here:
+
+> The heartbeat is written when the lease is checked, and the lease is only
+> checked before a destructive operation. A perfectly healthy production site
+> that has simply not deleted anything for a while therefore has an old
+> heartbeat. A timeout would read that as "production is gone" and hand the
+> lease to whoever asked next — which, in the scenario this whole section
+> exists for, is the test copy asking.
+
+An old heartbeat means *"nobody has needed to delete anything"*, never *"that
+server is gone"*. Only a person can tell the difference, so only a person moves
+the lease: **Take Ownership of This Storage**. The age is shown so they can
+judge it, and an hourly scheduler job re-stamps the owner's heartbeat so "last
+seen" reflects the site being alive rather than the last time it happened to
+delete something.
+
+The cost is real and deliberate: a server whose identity legitimately changes —
+a rename, a rebuilt container — stops deleting until someone presses the
+button. A blocked delete is recoverable; a silent takeover is not. Deployments
+where the identity changes routinely should pin it with
+`AWS_S3_STORAGE_INSTANCE` (below) so it never changes in the first place.
+
+##### Cost and timing
+
+The lease is read at most once every **60 seconds** per server, and only on the
+destructive path, so uploads never pay for it. That interval is also the bound
+on the other direction: **a server that has just lost ownership can keep acting
+on its previous answer for up to a minute.** Taking ownership stops the old
+server within that window, not instantly.
+
+Writes are conditional — `If-None-Match: *` to create, `If-Match: <etag>` to
+replace — so two servers racing cannot both believe they won, and a heartbeat
+never overwrites a takeover that happened since it read. An S3-compatible
+endpoint that does not support conditional writes cannot give a safe answer, so
+it does not get one: the state stays *unverified* and destructive work waits.
+The one exception is **Take Ownership**, which falls back to a plain write and
+logs that it did, because there a person has explicitly decided.
+
+The lease needs `s3:GetObject` and `s3:PutObject` on `.aws_s3_storage/*`, which
+the bucket-wide policy in §1.2 already grants.
 
 **This is also what makes "take ownership" mean something on a second server.**
 Claiming writes the lease, so the other server discovers on its next check that
@@ -1102,8 +1149,13 @@ make production's past decisions, taken against a database this site cannot
 vouch for, this site's to carry out. Those rows show as `Blocked` with the
 reason, and can be reviewed.
 
-Rows written before this version carry no environment, and are treated as this
-one's. Park them explicitly after a restore (9.6, step 4).
+A row with **no** environment recorded is parked too, not run. Rows written
+before this column existed cannot be told apart from rows a restored copy
+brought with it, and "we do not know who asked for this deletion" is not
+permission to carry it out. On the site that really owns the bucket, **Adopt N
+Unattributed Deletion(s)** attributes them to it and puts them back in the
+queue — a person saying "yes, these are mine", on the only machine where the
+answer is known.
 
 #### 9.9 Two related cases
 
@@ -1123,10 +1175,14 @@ one's. Park them explicitly after a restore (9.6, step 4).
 
 The checks above cover this app's own code paths. They do not cover:
 
+- **anything that is not this app.** Another app, a `bench execute`, a shell, a
+  script — all of them hold the same credentials and none of them go through
+  any of this. 9.5 is the only answer to that, and it is why 9.5 is the primary
+  protection and this section is the second line;
 - a **bit-identical** copy of a server, unless `AWS_S3_STORAGE_INSTANCE` is set
   per deployment (9.3);
-- another app, a `bench execute`, or a shell with the same credentials — use
-  9.5 for that;
+- the first **60 seconds** after ownership moves, during which the previous
+  holder may still act on its cached answer (9.3);
 - links embedded in rich text, HTML fields and Print Formats (see §6, *Audit
   Local Links*): those are not `File` records and are not repointed;
 - a bucket or endpoint change: files do not record which storage they came from,

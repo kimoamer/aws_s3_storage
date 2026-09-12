@@ -104,12 +104,16 @@ INSTANCE_ENV_VAR = "AWS_S3_STORAGE_INSTANCE"
 # SERVABLE_PREFIXES, so it is never reachable through the download endpoint.
 LEASE_KEY = ".aws_s3_storage/owner.json"
 _LEASE_CACHE_KEY = "aws_s3_storage:owner_lease"
-# How long a worker trusts its last lease check, and how often the holder
-# refreshes its heartbeat. One GetObject per worker per interval.
-LEASE_CHECK_INTERVAL = 600
-# A lease nobody has refreshed for this long is treated as abandoned, so a
-# renamed host, a rebuilt container or a genuine server move recovers on its own
-# instead of needing a button.
+# How long a lease check is trusted before going back to the bucket. This is
+# also the bound on how long a server that has just lost ownership can still act
+# on its old answer, so it is short: a destructive operation is already several
+# S3 calls, one more is not what makes it slow.
+LEASE_CHECK_INTERVAL = 60
+# How often the holder re-stamps its own heartbeat while checking.
+LEASE_HEARTBEAT_INTERVAL = 600
+# A lease older than this is *reported* as stale in the UI so an administrator
+# can judge whether the other server is really gone. Nothing is granted or
+# withdrawn on the strength of it — see the note above _lease_state.
 LEASE_STALE_AFTER = 3600
 
 LEASE_OK = "ok"
@@ -262,91 +266,164 @@ def is_foreign(settings=None):
 # see the other — because nothing they compare lives anywhere they share.
 #
 # The bucket is the thing they share. The lease is a small object in it naming
-# the server that currently holds ownership, refreshed on a heartbeat. Before
-# anything destructive, an environment checks that the lease still names it:
+# the server that currently holds ownership. Before anything destructive, an
+# environment checks that the lease still names it:
 #
-#   * lease names this instance      -> proceed (and refresh the heartbeat)
-#   * lease names an instance that
-#     has not been heard from in an
-#     hour                           -> take it over; the previous holder is gone
-#                                       (a renamed host, a rebuilt container, a
-#                                       finished server move — recovers itself)
-#   * lease names a *live* instance  -> two servers are running this site against
-#                                       one bucket. Stand down here, loudly.
+#   * lease names this instance      -> proceed
+#   * lease names anything else      -> stand down, whatever its age
+#   * lease missing / unreadable     -> stand down
 #
-# So a clone that kept every copied identity is still caught, as long as the
-# machine it runs on differs from the original's (see instance_id).
+# Taking a lease away from the server that holds it is ALWAYS an explicit human
+# action (claim_storage). There is deliberately no rule by which one environment
+# takes over from another on its own, and in particular no timeout:
+#
+#   the heartbeat is written when the lease is checked, and the lease is only
+#   checked on the destructive path, so a perfectly healthy production site that
+#   simply has not deleted anything for a while has an old heartbeat. A timeout
+#   would read that as "production is gone" and hand the lease to whoever asked
+#   next — which, in the scenario this whole module exists for, is the test copy.
+#   An old heartbeat means "nobody has needed to delete anything", never "that
+#   server is gone".
+#
+# The cost is that a server whose identity legitimately changes (a rename, a
+# rebuilt container) needs someone to press the button. That is the right way
+# round: a blocked delete is recoverable, a silent takeover is not. Deployments
+# where the identity changes routinely should pin it with AWS_S3_STORAGE_INSTANCE.
+#
+# Writes to the lease are conditional (If-None-Match to create, If-Match to
+# replace) so two servers racing cannot both believe they won.
 
 
-def _lease_state(status, reason=None, holder=None):
-	return frappe._dict(status=status, reason=reason, holder=holder or {})
+def _lease_state(status, reason=None, holder=None, stale=False):
+	return frappe._dict(status=status, reason=reason, holder=holder or {}, stale=stale)
 
 
 def _read_lease(settings):
-	"""The lease object, ``None`` if it does not exist yet. Raises on anything else."""
+	"""``(lease, etag)``; ``(None, None)`` when the object does not exist yet.
+
+	The ETag is what makes the next write conditional, so it travels with the
+	content rather than being fetched again.
+	"""
 	from aws_s3_storage.aws_s3_storage import s3_utils
 
 	s3 = s3_utils.get_s3_client()
 	try:
-		body = s3.get_object(Bucket=settings.bucket_name, Key=LEASE_KEY)["Body"].read()
+		response = s3.get_object(Bucket=settings.bucket_name, Key=LEASE_KEY)
 	except Exception as e:
 		code = getattr(e, "response", {}).get("Error", {}).get("Code")
 		if code in s3_utils._NOT_FOUND_CODES:
-			return None
+			return None, None
 		raise
+
+	etag = response.get("ETag")
 	try:
-		return json.loads(body.decode("utf-8"))
+		return json.loads(response["Body"].read().decode("utf-8")), etag
 	except Exception:
-		# Unreadable content is not "no lease": something wrote there. Treat it as
-		# a lease we do not hold rather than silently replacing it.
-		return {"owner_id": "", "instance": "", "site": "", "heartbeat_at": now_datetime().isoformat()}
+		# Something wrote there that is not ours. That is not "no lease" — treat it
+		# as a lease we do not hold, so we stand down rather than overwrite it.
+		return {"owner_id": "", "instance": "", "site": "", "heartbeat_at": None}, etag
 
 
-def _write_lease(settings):
-	from aws_s3_storage.aws_s3_storage import s3_utils
-
-	payload = {
+def _lease_payload(settings):
+	return {
 		"owner_id": recorded_owner_id(settings),
 		"instance": instance_id(),
 		"site": current_site(),
 		"host": socket.gethostname() or "",
 		"heartbeat_at": now_datetime().isoformat(),
 	}
-	s3_utils.get_s3_client().put_object(
-		Bucket=settings.bucket_name,
-		Key=LEASE_KEY,
-		Body=json.dumps(payload, indent=1).encode("utf-8"),
-		ContentType="application/json",
-	)
-	return payload
 
 
-def _lease_is_stale(lease):
+def _put_lease(settings, payload, if_match=None, if_none_match=None):
+	"""Write the lease. Returns ``(written, failure)``.
+
+	``failure`` is "precondition" when somebody else got there first, or
+	"unconditional" when the endpoint does not support conditional writes at all
+	(older S3-compatible services) and the write was therefore not attempted.
+	"""
+	from botocore.exceptions import ClientError, ParamValidationError
+
+	from aws_s3_storage.aws_s3_storage import s3_utils
+
+	kwargs = {
+		"Bucket": settings.bucket_name,
+		"Key": LEASE_KEY,
+		"Body": json.dumps(payload, indent=1).encode("utf-8"),
+		"ContentType": "application/json",
+	}
+	if if_match:
+		kwargs["IfMatch"] = if_match
+	if if_none_match:
+		kwargs["IfNoneMatch"] = if_none_match
+
 	try:
-		age = (now_datetime() - get_datetime(lease.get("heartbeat_at"))).total_seconds()
+		s3_utils.get_s3_client().put_object(**kwargs)
+		return True, None
+	except ParamValidationError:
+		# botocore too old to send the condition. Refusing beats racing.
+		return False, "unconditional"
+	except ClientError as e:
+		code = (e.response.get("Error", {}) or {}).get("Code")
+		if code in ("PreconditionFailed", "ConditionalRequestConflict", "412"):
+			return False, "precondition"
+		if code in ("NotImplemented", "InvalidRequest", "InvalidArgument"):
+			return False, "unconditional"
+		raise
+
+
+def _write_lease(settings, if_match=None, expect_absent=False):
+	"""Take or refresh the lease, refusing to overwrite a change we did not see."""
+	payload = _lease_payload(settings)
+	written, failure = _put_lease(
+		settings,
+		payload,
+		if_match=if_match,
+		if_none_match="*" if expect_absent else None,
+	)
+	if written:
+		return payload
+	if failure == "precondition":
+		raise LeaseRaceError("another server wrote the ownership lease first")
+	raise LeaseRaceError(
+		"this endpoint does not support conditional writes, so the ownership lease "
+		"cannot be taken safely (two servers could both believe they won)"
+	)
+
+
+class LeaseRaceError(Exception):
+	pass
+
+
+def _lease_age(lease):
+	try:
+		return (now_datetime() - get_datetime(lease.get("heartbeat_at"))).total_seconds()
 	except Exception:
-		return True
-	return age > LEASE_STALE_AFTER
+		return None
 
 
 def check_lease(settings=None, refresh=False):
 	"""Whether this server still holds the bucket's ownership lease.
 
-	Cached per worker for ``LEASE_CHECK_INTERVAL``; only destructive operations
-	consult it, so an upload never pays for a round-trip.
+	Cached for ``LEASE_CHECK_INTERVAL`` seconds, per bucket *and per server and
+	recorded owner*: the cache is the site's Redis, shared by every worker and
+	every machine running this site, so a decision made by one server must never
+	be reused by another. The short window is also the bound on how long a server
+	that has just lost ownership can keep acting on the old answer.
 	"""
 	settings = _settings(settings)
 	if not settings.bucket_name:
 		return _lease_state(LEASE_UNVERIFIED, "No bucket is configured.")
 
-	cache_key = f"{_LEASE_CACHE_KEY}:{settings.bucket_name}"
+	cache_key = _lease_cache_key(settings)
 	if not refresh:
 		try:
 			cached = frappe.cache().get_value(cache_key)
 		except Exception:
 			cached = None
 		if cached:
-			return _lease_state(cached.get("status"), cached.get("reason"), cached.get("holder"))
+			return _lease_state(
+				cached.get("status"), cached.get("reason"), cached.get("holder"), cached.get("stale")
+			)
 
 	result = _evaluate_lease(settings)
 	try:
@@ -356,12 +433,30 @@ def check_lease(settings=None, refresh=False):
 	return result
 
 
+def _lease_cache_key(settings):
+	"""Scoped so one server's answer can never be served to another.
+
+	frappe.cache() is the site's Redis, which several application servers of the
+	same site share. A key naming only the bucket would let a second server read
+	the first one's "yes".
+	"""
+	scope = "|".join(
+		[
+			settings.bucket_name or "",
+			(settings.get("endpoint_url") or "").strip(),
+			recorded_owner_id(settings),
+			instance_id(),
+		]
+	)
+	return f"{_LEASE_CACHE_KEY}:{hashlib.sha256(scope.encode('utf-8')).hexdigest()[:24]}"
+
+
 def _evaluate_lease(settings):
 	info = ownership(settings)
 	mine = instance_id()
 
 	try:
-		lease = _read_lease(settings)
+		lease, etag = _read_lease(settings)
 	except Exception as e:
 		# Cannot see the bucket's lease -> cannot rule out a second live writer.
 		# Destructive work waits; uploads are unaffected, and a failed delete is
@@ -378,8 +473,12 @@ def _evaluate_lease(settings):
 				LEASE_UNVERIFIED,
 				"The bucket carries no ownership lease, and this site is not in a position to write one.",
 			)
+		# If-None-Match: if another server creates it in the same moment, exactly
+		# one of the two writes lands and the loser stands down.
 		try:
-			return _lease_state(LEASE_OK, holder=_write_lease(settings))
+			return _lease_state(LEASE_OK, holder=_write_lease(settings, expect_absent=True))
+		except LeaseRaceError as e:
+			return _lease_state(LEASE_UNVERIFIED, f"Could not take the ownership lease: {e}")
 		except Exception as e:
 			return _lease_state(LEASE_UNVERIFIED, f"Could not write the ownership lease ({e}).")
 
@@ -394,51 +493,82 @@ def _evaluate_lease(settings):
 		)
 
 	if (lease.get("instance") or "") == mine:
-		_refresh_heartbeat(settings, lease)
+		_refresh_heartbeat(settings, lease, etag)
 		return _lease_state(LEASE_OK, holder=lease)
 
-	if _lease_is_stale(lease):
-		# Nobody has refreshed it for LEASE_STALE_AFTER — the previous holder is
-		# gone. Taking it over here is what lets a rebuilt container or a finished
-		# server move heal without intervention.
-		if info.state != OWNER or read_only_mode(settings):
-			return _lease_state(LEASE_UNVERIFIED, "The lease is stale and this site cannot take it over.")
-		try:
-			return _lease_state(LEASE_OK, holder=_write_lease(settings))
-		except Exception as e:
-			return _lease_state(LEASE_UNVERIFIED, f"Could not take over the ownership lease ({e}).")
-
+	# Held by another server. Age is reported, never acted on: the heartbeat is
+	# only written when the lease is checked, and the lease is only checked before
+	# a destructive operation, so an old one means "that server has had nothing to
+	# delete", not "that server is gone". Handing the lease over on a timeout is
+	# precisely how a test copy would acquire it.
+	age = _lease_age(lease)
+	stale = age is None or age > LEASE_STALE_AFTER
+	when = lease.get("heartbeat_at") or "never"
 	return _lease_state(
 		LEASE_CONFLICT,
-		"Another server is live against this same bucket with the same recorded owner"
+		"The bucket's ownership lease is held by another server"
 		+ (f" (host '{lease.get('host')}', site '{lease.get('site')}')" if lease.get("host") else "")
-		+ f", last seen {lease.get('heartbeat_at')}. This looks like a copy of the server, "
-		"or an old and a new server running side by side. Nothing in the bucket will be "
-		"deleted or moved from here until one of them takes ownership.",
+		+ f", last seen {when}. Nothing in the bucket will be deleted, moved or overwritten from "
+		"here. If that server is genuinely gone — decommissioned, renamed, rebuilt — use 'Take "
+		"Ownership of This Storage' to move the lease deliberately. If it is still live, this "
+		"site is a copy of it: give it its own bucket.",
 		lease,
+		stale=stale,
 	)
 
 
-def _refresh_heartbeat(settings, lease):
-	"""Re-stamp our own lease when it is getting old, so it never looks abandoned."""
+def _refresh_heartbeat(settings, lease, etag):
+	"""Re-stamp our own lease so an administrator can see this server is alive.
+
+	Informational only — nothing grants or withdraws permission on the strength
+	of a heartbeat's age (see the note above). Conditional on the ETag, so a
+	refresh never overwrites a takeover that happened since we read it.
+	"""
 	if read_only_mode(settings):
 		return
-	try:
-		age = (now_datetime() - get_datetime(lease.get("heartbeat_at"))).total_seconds()
-	except Exception:
-		age = LEASE_STALE_AFTER
-	if age < LEASE_CHECK_INTERVAL:
+	age = _lease_age(lease)
+	if age is not None and age < LEASE_HEARTBEAT_INTERVAL:
 		return
 	try:
-		_write_lease(settings)
+		_write_lease(settings, if_match=etag)
+	except LeaseRaceError:
+		# Somebody took the lease between the read and here. Drop the cached "yes"
+		# so the next check sees the new holder instead of our stale answer.
+		_clear_lease_cache(settings)
 	except Exception as e:
 		frappe.logger().warning(f"aws_s3_storage: could not refresh the ownership lease: {e}")
+
+
+def heartbeat():
+	"""Scheduler job: keep the owner's lease visibly current.
+
+	Without it the only thing that ever refreshes the lease is a deletion, so an
+	administrator looking at "last seen" on a quiet site would see a date from
+	months ago and have no way to tell a live owner from an abandoned one.
+	"""
+	settings = frappe.get_single("S3 Settings")
+	if not settings.bucket_name or read_only_mode(settings):
+		return
+	if ownership(settings).state != OWNER:
+		return
+	try:
+		lease, etag = _read_lease(settings)
+	except Exception:
+		return
+	if lease is None:
+		return
+	if (lease.get("instance") or "") != instance_id():
+		return
+	try:
+		_write_lease(settings, if_match=etag)
+	except Exception:
+		pass
 
 
 def _clear_lease_cache(settings=None):
 	settings = _settings(settings)
 	try:
-		frappe.cache().delete_value(f"{_LEASE_CACHE_KEY}:{settings.bucket_name}")
+		frappe.cache().delete_value(_lease_cache_key(settings))
 	except Exception:
 		pass
 
@@ -487,9 +617,10 @@ def claim(settings=None, force=False, adopt_existing_files=False):
 	# the owner, because nothing it can see has changed.
 	_clear_lease_cache()
 	lease_error = None
-	if frappe.get_single("S3 Settings").bucket_name:
+	fresh = frappe.get_single("S3 Settings")
+	if fresh.bucket_name:
 		try:
-			_write_lease(frappe.get_single("S3 Settings"))
+			_take_lease_explicitly(fresh)
 		except Exception as e:
 			lease_error = str(e)
 			frappe.logger().error(f"aws_s3_storage: claimed locally but could not take the lease: {e}")
@@ -499,6 +630,35 @@ def claim(settings=None, force=False, adopt_existing_files=False):
 	info = ownership()
 	info.lease_error = lease_error
 	return info
+
+
+def _take_lease_explicitly(settings, attempts=2):
+	"""Move the lease to this server because a person asked for it.
+
+	Still conditional, so two administrators pressing the button at the same
+	moment cannot both succeed; the loser re-reads and retries once. An endpoint
+	with no conditional writes falls back to a plain write *only here*, because
+	this path is a deliberate human decision rather than something the software
+	chose — and it is recorded in the log.
+	"""
+	for attempt in range(attempts):
+		lease, etag = _read_lease(settings)
+		try:
+			if lease is None:
+				return _write_lease(settings, expect_absent=True)
+			return _write_lease(settings, if_match=etag)
+		except LeaseRaceError:
+			if attempt + 1 < attempts:
+				continue
+			written, failure = _put_lease(settings, _lease_payload(settings))
+			if written:
+				frappe.logger().warning(
+					"aws_s3_storage: took the ownership lease without a condition — this endpoint "
+					"does not support conditional writes, so a simultaneous takeover elsewhere "
+					"would not have been detected."
+				)
+				return _lease_payload(settings)
+			raise RuntimeError(f"could not take the ownership lease ({failure})")
 
 
 def _write_local_owner_id(owner_id):
@@ -768,6 +928,7 @@ def get_environment_status(check_bucket=0):
 		status["lease_status"] = lease.status
 		status["lease_reason"] = lease.reason
 		status["lease_holder"] = lease.holder
+		status["lease_stale"] = bool(lease.stale)
 
 	if frappe.db.has_column("File", "s3_owner"):
 		if info.owner_id:
@@ -779,6 +940,9 @@ def get_environment_status(check_bucket=0):
 		)
 	status["blocked_deletions"] = frappe.db.count("S3 Deletion Queue", {"status": "Blocked"})
 	status["pending_deletions"] = frappe.db.count("S3 Deletion Queue", {"status": "Pending"})
+	status["unattributed_deletions"] = frappe.db.count(
+		"S3 Deletion Queue", {"requested_by_environment": ["in", ["", None]]}
+	)
 	return status
 
 
@@ -802,6 +966,36 @@ def claim_storage(adopt_existing_files=0):
 		"instance": instance_id(),
 		"lease_error": info.get("lease_error"),
 	}
+
+
+@frappe.whitelist()
+def adopt_unattributed_deletions():
+	"""Attribute deletion requests that record no environment to this one.
+
+	Rows queued before the environment column existed cannot be told apart from
+	rows a restored copy brought with it, so they are parked rather than run.
+	This is the deliberate "yes, these are mine" — it is a person saying it, on
+	the site that owns the bucket, which is the only place the answer is known.
+	"""
+	frappe.only_for("System Manager")
+	owner_id = recorded_owner_id()
+	if not owner_id:
+		frappe.throw("This site has not claimed the storage, so it cannot adopt deletion requests.")
+
+	names = frappe.get_all(
+		"S3 Deletion Queue",
+		filters={"requested_by_environment": ["in", ["", None]]},
+		pluck="name",
+	)
+	for name in names:
+		frappe.db.set_value(
+			"S3 Deletion Queue",
+			name,
+			{"requested_by_environment": owner_id, "status": "Pending", "last_error": None},
+			update_modified=False,
+		)
+	frappe.db.commit()
+	return {"adopted": len(names)}
 
 
 @frappe.whitelist()

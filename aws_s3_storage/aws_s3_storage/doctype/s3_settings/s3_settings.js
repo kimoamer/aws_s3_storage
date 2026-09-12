@@ -217,6 +217,14 @@ function show_ownership_state(frm) {
 				return;
 			}
 
+			if (s.unattributed_deletions) {
+				frm.add_custom_button(
+					__("Adopt {0} Unattributed Deletion(s)", [s.unattributed_deletions]),
+					() => adopt_unattributed_deletions(frm),
+					__("Storage Ownership")
+				);
+			}
+
 			// The bucket says another live server holds ownership. Local state looks
 			// fine — that is the point: this is the only signal a copy of the whole
 			// server produces, so it has to be the loudest thing on the form.
@@ -226,7 +234,7 @@ function show_ownership_state(frm) {
 					`<b>${__("Another server is using this bucket right now.")}</b><br>` +
 						`${frappe.utils.escape_html(s.lease_reason || "")}<br><br>` +
 						__(
-							"Nothing in the bucket will be deleted, moved or overwritten from this site until that is resolved. If this site is the copy, point it at its own bucket. If this site is the real one and the other is gone, use <b>Take Ownership of This Storage</b>."
+							"Nothing in the bucket will be deleted, moved or overwritten from this site until that is resolved. If this site is the copy, point it at its own bucket. If this site is the real one and the other server is genuinely gone, use <b>Take Ownership of This Storage</b> — ownership never moves on its own, however long the other server has been quiet."
 						),
 					"red",
 					true
@@ -306,14 +314,19 @@ function confirm_take_ownership(frm) {
 
 function show_take_ownership_dialog(frm, status) {
 	const holder = status.lease_holder || {};
+	const stale_note = status.lease_stale
+		? __(
+				"It has not been seen for a while — but that only means it has had nothing to delete, not that it is gone. Check that server yourself before continuing."
+		  )
+		: "";
 	const contested =
 		status.lease_status === "conflict"
-			? `<p class="text-danger"><b>${__("Another server is live against this bucket right now")}</b>${
+			? `<p class="text-danger"><b>${__("Another server currently holds this bucket")}</b>${
 					holder.host ? ` (${frappe.utils.escape_html(holder.host)})` : ""
 			  }${
 					holder.heartbeat_at ? `, ${__("last seen")} ${frappe.utils.escape_html(holder.heartbeat_at)}` : ""
-			  }. ${__(
-					"Taking ownership here will stop that server from deleting or moving anything. Do this only if you know it should no longer be using the bucket."
+			  }. ${stale_note} ${__(
+					"Taking ownership here will stop that server from deleting or moving anything, within a minute. Do this only if you know it should no longer be using the bucket."
 			  )}</p>`
 			: "";
 
@@ -370,6 +383,28 @@ function show_take_ownership_dialog(frm, status) {
 		},
 	});
 	d.show();
+}
+
+function adopt_unattributed_deletions(frm) {
+	frappe.confirm(
+		__(
+			"Some queued deletions record no environment — they were queued before this was tracked, and cannot be told apart from requests a restored copy brought with it, so they are parked. Confirm that they belong to <b>this</b> site and should be retried?"
+		),
+		() => {
+			frappe.call({
+				method: "aws_s3_storage.aws_s3_storage.environment.adopt_unattributed_deletions",
+				freeze: true,
+				callback: (r) => {
+					if (r.exc) return;
+					frappe.show_alert({
+						message: __("{0} request(s) adopted.", [(r.message && r.message.adopted) || 0]),
+						indicator: "green",
+					});
+					frm.refresh();
+				},
+			});
+		}
+	);
 }
 
 function park_inherited_deletions(frm) {
