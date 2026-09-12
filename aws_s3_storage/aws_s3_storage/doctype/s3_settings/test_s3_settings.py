@@ -1969,47 +1969,148 @@ class TestS3Settings(FrappeTestCase):
 
 	# --- the lease cannot be won by two servers at once --------------------
 
-	def test_creating_the_lease_is_conditional(self):
-		# Two servers both find no lease and both write. Without a condition both
-		# believe they won; with If-None-Match exactly one does.
-		with self._owner_site():
-			self._clear_lease_cache()
-			with (
-				patch.object(environment, "_read_lease", return_value=(None, None)),
-				patch.object(environment, "_put_lease", return_value=(True, None)) as put,
-			):
-				environment.check_lease(refresh=True)
-			self.assertEqual(put.call_args.kwargs.get("if_none_match"), "*")
-			self._clear_lease_cache()
-		self._seed_lease(environment.LEASE_OK)
+	def test_a_missing_lease_grants_nothing_to_anybody(self):
+		"""Whoever asks first must not win an empty bucket.
 
-	def test_the_loser_of_a_lease_race_does_not_get_permission(self):
+		Every copy of a server passes the local checks — that is why the lease
+		exists at all — so "the first site to find no lease creates one and may
+		then delete" hands ownership to the test copy exactly as readily as to
+		production. A bucket with no lease is initialised once, deliberately.
+		"""
 		with self._owner_site():
 			self._clear_lease_cache()
 			with (
 				patch.object(environment, "_read_lease", return_value=(None, None)),
-				patch.object(environment, "_put_lease", return_value=(False, "precondition")),
+				patch.object(environment, "_put_lease") as put,
 			):
 				result = environment.check_lease(refresh=True)
 				self.assertEqual(result.status, environment.LEASE_UNVERIFIED)
 				self.assertFalse(environment.may_destroy())
+			put.assert_not_called()
 			self._clear_lease_cache()
 		self._seed_lease(environment.LEASE_OK)
 
-	def test_an_endpoint_without_conditional_writes_does_not_take_the_lease(self):
-		# Refusing beats racing: an S3-compatible service that cannot do
-		# conditional writes cannot give a safe answer, so it does not get one.
+	def test_bench_migrate_never_replaces_an_existing_lease(self):
+		# The automatic half of claiming. Restoring an old database with no owner
+		# id and running bench migrate must not take production's lease — the
+		# documentation promises only a person can do that.
+		held = self._live_lease(owner_id="prod-environment", instance="prod-server")
+		with self._environment(db_owner="", disk_owner=None):
+			with (
+				patch.object(environment, "_read_lease", return_value=(held, '"etag"')),
+				patch.object(environment, "_put_lease", return_value=(False, "precondition")) as put,
+				patch.object(environment, "_write_local_owner_id"),
+			):
+				environment.claim_if_unclaimed()
+			# It may *try* to create one, but only conditionally — never a replace.
+			for call in put.call_args_list:
+				self.assertEqual(call.kwargs.get("if_none_match"), "*")
+				self.assertIsNone(call.kwargs.get("if_match"))
+
+	def test_read_only_mode_writes_no_lease_either(self):
+		# Writing the lease is a write to the bucket like any other.
+		frappe.db.set_single_value("S3 Settings", "read_only_mode", 1)
+		with self._environment(db_owner="", disk_owner=None):
+			with (
+				patch.object(environment, "_read_lease", return_value=(None, None)),
+				patch.object(environment, "_put_lease") as put,
+				patch.object(environment, "_write_local_owner_id"),
+			):
+				environment.claim_if_unclaimed()
+			put.assert_not_called()
+
+	def test_losing_the_heartbeat_race_withdraws_permission(self):
+		"""Direct evidence that ownership moved must not be answered with "yes".
+
+		The conditional refresh being rejected means the lease changed between the
+		read and the write. That is not the documented 60-second cache window —
+		it is proof, in hand, that this server no longer holds the lease.
+		"""
+		ours = self._live_lease(instance="old-server")
+		ours["heartbeat_at"] = add_to_date(
+			now_datetime(), seconds=-(environment.LEASE_HEARTBEAT_INTERVAL + 60)
+		).isoformat()
+		theirs = self._live_lease(instance="new-server")
+
 		with self._owner_site():
 			self._clear_lease_cache()
 			with (
-				patch.object(environment, "_read_lease", return_value=(None, None)),
-				patch.object(environment, "_put_lease", return_value=(False, "unconditional")),
+				patch.object(environment, "instance_id", return_value="old-server"),
+				patch.object(environment, "_read_lease", side_effect=[(ours, '"old"'), (theirs, '"new"')]),
+				patch.object(environment, "_put_lease", return_value=(False, "precondition")),
 			):
 				result = environment.check_lease(refresh=True)
-				self.assertEqual(result.status, environment.LEASE_UNVERIFIED)
-				self.assertIn("conditional writes", result.reason)
+				self.assertEqual(result.status, environment.LEASE_CONFLICT)
+				self.assertFalse(environment.may_destroy())
 			self._clear_lease_cache()
 		self._seed_lease(environment.LEASE_OK)
+
+	def test_losing_a_takeover_race_is_not_a_licence_to_skip_the_condition(self):
+		# The two failures must never be conflated: "this endpoint cannot do
+		# conditional writes" is a missing capability, "somebody else got there
+		# first" is the condition doing its job.
+		with self._owner_site():
+			with (
+				patch.object(
+					environment, "_read_lease", return_value=(self._live_lease(instance="them"), '"e"')
+				),
+				patch.object(environment, "_put_lease", return_value=(False, "precondition")) as put,
+			):
+				with self.assertRaises(RuntimeError):
+					environment._take_lease_explicitly(frappe.get_single("S3 Settings"))
+			# Every attempt carried a condition; none was retried without one.
+			for call in put.call_args_list:
+				self.assertTrue(call.kwargs.get("if_match") or call.kwargs.get("if_none_match"))
+
+	def test_an_endpoint_without_conditional_writes_does_not_take_the_lease(self):
+		# Refusing beats racing: an S3-compatible service that cannot do
+		# conditional writes cannot give a safe answer automatically...
+		with self._owner_site():
+			self._clear_lease_cache()
+			with (
+				patch.object(
+					environment, "_read_lease", return_value=(self._live_lease(instance="me"), '"e"')
+				),
+				patch.object(environment, "instance_id", return_value="me"),
+				patch.object(environment, "_put_lease", return_value=(False, "unconditional")),
+			):
+				# The heartbeat cannot be written, but we do still hold the lease.
+				self.assertEqual(environment.check_lease(refresh=True).status, environment.LEASE_OK)
+			self._clear_lease_cache()
+		self._seed_lease(environment.LEASE_OK)
+
+	def test_an_unsupported_endpoint_still_allows_a_person_to_take_over(self):
+		# ... but a person asking explicitly is a different matter, and it is logged.
+		def conditional_writes_unsupported(settings, payload, if_match=None, if_none_match=None):
+			return (False, "unconditional") if (if_match or if_none_match) else (True, None)
+
+		with self._owner_site():
+			with (
+				patch.object(
+					environment, "_read_lease", return_value=(self._live_lease(instance="them"), '"e"')
+				),
+				patch.object(environment, "_put_lease", side_effect=conditional_writes_unsupported),
+			):
+				self.assertTrue(environment._take_lease_explicitly(frappe.get_single("S3 Settings")))
+
+	def test_reclaiming_as_the_owner_keeps_the_owner_id(self):
+		# The id is stamped on every File.s3_owner, so minting a new one on a
+		# routine "take ownership" would leave the owner unable to touch its own
+		# files.
+		with self._owner_site():
+			with (
+				patch.object(environment, "_write_local_owner_id"),
+				patch.object(environment, "_take_lease_explicitly"),
+			):
+				environment.claim(force=True)
+			self.assertEqual(environment.recorded_owner_id(), "this-environment")
+
+	def test_a_restored_copy_cannot_adopt_deletion_requests(self):
+		# Holding an owner id proves nothing — the copy holds the same one,
+		# because it came out of the same database.
+		with self._restored_copy():
+			with self.assertRaises(frappe.ValidationError):
+				environment.adopt_unattributed_deletions()
 
 	def test_the_heartbeat_never_overwrites_a_takeover(self):
 		lease = self._live_lease(instance="me")
@@ -2082,7 +2183,13 @@ class TestS3Settings(FrappeTestCase):
 		s3 = MagicMock()
 		mock_get_client.return_value = s3
 
-		with self._owner_site(), patch.object(frappe.db, "commit"):
+		# Adoption re-reads the lease rather than trusting the cache: it turns a
+		# parked request into a live deletion, so it takes a deletion's proof.
+		with (
+			self._owner_site(),
+			self._with_lease(self._live_lease(instance="me"), instance="me"),
+			patch.object(frappe.db, "commit"),
+		):
 			adopted = environment.adopt_unattributed_deletions()
 			self.assertGreaterEqual(adopted["adopted"], 1)
 			self.assertEqual(

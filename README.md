@@ -970,8 +970,33 @@ lease still names it:
 | This server | Proceed |
 | Any other server, **at any age** | **Conflict.** Stand down, and say so in red on the S3 Settings form |
 | A different owner id entirely | **Conflict.** Two environments are pointed at one bucket |
-| Missing, and this site is the recorded owner | Create it, conditionally (`If-None-Match: *`) so a simultaneous create elsewhere cannot also succeed |
+| Missing | **Unverified**, for everyone. Nothing is created from the check path and nobody is granted anything — see below |
 | Unreadable (no access, S3 down) | **Unverified.** Destructive work waits; uploads carry on, because a failed delete is queued and nothing is lost, while a blocked upload would silently scatter files onto local disk |
+
+##### A bucket with no lease grants nothing
+
+Whoever asks first must not win an empty bucket. Every copy of a server passes
+the local checks — that is the entire reason the lease exists — so a rule like
+"the first site to find no lease creates one and may then delete" would hand
+ownership to the test copy exactly as readily as to production. It is the same
+mistake as a timeout, arriving from the other direction.
+
+So a missing lease is *unverified* for everyone, and the bucket is initialised
+once, deliberately:
+
+- **A new install** creates it automatically (`If-None-Match: *`, so a
+  simultaneous create elsewhere cannot also succeed). That is the only
+  automatic write, it only ever *creates*, and it never replaces a lease
+  another server holds — restoring an old database and running `bench migrate`
+  leaves production's lease exactly where it is.
+- **Upgrading a site that was already running this app** has an owner id
+  already, so nothing is created automatically. The S3 Settings form will say
+  the lease is missing; press **Take Ownership of This Storage** once, on the
+  site that really owns the bucket. Until you do, files are served normally and
+  nothing in the bucket is deleted, moved or overwritten.
+
+Read-Only Mode writes no lease either — writing the lease is a write to the
+bucket like any other.
 
 ##### Ownership never moves on its own
 
@@ -1008,12 +1033,18 @@ on its previous answer for up to a minute.** Taking ownership stops the old
 server within that window, not instantly.
 
 Writes are conditional — `If-None-Match: *` to create, `If-Match: <etag>` to
-replace — so two servers racing cannot both believe they won, and a heartbeat
-never overwrites a takeover that happened since it read. An S3-compatible
-endpoint that does not support conditional writes cannot give a safe answer, so
-it does not get one: the state stays *unverified* and destructive work waits.
-The one exception is **Take Ownership**, which falls back to a plain write and
-logs that it did, because there a person has explicitly decided.
+replace — so two servers racing cannot both believe they won. Two failures that
+look alike are kept strictly apart:
+
+- **The condition was rejected** (somebody else got there first). That is the
+  condition doing its job, and it is never a reason to repeat the write without
+  it. A heartbeat that is rejected means ownership moved while we were looking
+  at it, so the check re-reads and answers *conflict* — it does not go on to
+  say "yes" on the strength of the lease it read a moment earlier.
+- **The endpoint cannot do conditional writes at all** (some S3-compatible
+  services). Nothing was attempted. **Take Ownership** — and only it, because
+  there a person has explicitly decided — falls back to a plain write and logs
+  that it did.
 
 The lease needs `s3:GetObject` and `s3:PutObject` on `.aws_s3_storage/*`, which
 the bucket-wide policy in §1.2 already grants.
@@ -1099,6 +1130,12 @@ environment that cannot write to the bucket has nothing to hold back.
 
 #### 9.6 Checklist: restoring production onto a test site
 
+0. **On production, before you clone anything:** open S3 Settings and make sure
+   the banner says this site owns the storage *and* the lease is recorded. If it
+   says the lease is missing (the case right after upgrading to this version),
+   press **Take Ownership of This Storage** once. A bucket with no lease grants
+   nothing to anybody, including the copy — but recording it is what lets the
+   copy be told apart rather than merely held back.
 1. **Restore the database.** Do *not* copy `site_config.json` across — that file
    is what identifies the environment.
 2. **Open S3 Settings.** The banner should read *"This site does not own the
@@ -1155,7 +1192,11 @@ brought with it, and "we do not know who asked for this deletion" is not
 permission to carry it out. On the site that really owns the bucket, **Adopt N
 Unattributed Deletion(s)** attributes them to it and puts them back in the
 queue — a person saying "yes, these are mine", on the only machine where the
-answer is known.
+answer is known. Adoption turns a parked request into a live deletion, so it
+demands a deletion's proof: the environment checks *and* a freshly read lease.
+A restored copy cannot adopt, even though it carries the same owner id in its
+database, and only requests aimed at the bucket this site actually owns are
+adopted.
 
 #### 9.9 Two related cases
 
