@@ -578,7 +578,7 @@ def move_file_to_disk(row):
 	# the object. On a copy of another site's database that object is still live
 	# for the site that owns it, and the record being rewritten is that site's
 	# record — so this stands down entirely rather than doing half of it.
-	if not environment.guard("move a file out of S3", file_doc=row):
+	if not environment.guard("move a file out of S3", file_doc=row, destructive=True):
 		return None
 
 	content = s3_utils.read_file_from_s3(key)

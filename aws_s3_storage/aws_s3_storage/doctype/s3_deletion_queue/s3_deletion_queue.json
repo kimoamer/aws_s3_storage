@@ -10,7 +10,9 @@
   "bucket",
   "status",
   "attempts",
-  "last_error"
+  "last_error",
+  "requested_by_environment",
+  "object_owner"
  ],
  "fields": [
   {
@@ -47,6 +49,20 @@
    "fieldname": "last_error",
    "fieldtype": "Small Text",
    "label": "Last Error"
+  },
+  {
+   "description": "The environment that asked for this deletion. A row whose environment is not the current owner is never executed \u2014 a queue row is restored with the database, and it is that environment's decision, not this one's.",
+   "fieldname": "requested_by_environment",
+   "fieldtype": "Data",
+   "label": "Requested By Environment",
+   "read_only": 1
+  },
+  {
+   "description": "The environment that owned the object when the deletion was queued.",
+   "fieldname": "object_owner",
+   "fieldtype": "Data",
+   "label": "Object Owner",
+   "read_only": 1
   }
  ],
  "index_web_pages_for_search": 0,

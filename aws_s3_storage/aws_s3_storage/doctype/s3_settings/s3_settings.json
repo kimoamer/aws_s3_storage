@@ -12,6 +12,7 @@
   "column_break_env",
   "inherited_storage_policy",
   "storage_owner_site",
+  "storage_owner_instance",
   "storage_owner_claimed_at",
   "enabled",
   "bucket_name",
@@ -75,6 +76,13 @@
    "fieldname": "storage_owner_site",
    "fieldtype": "Data",
    "label": "Owner Site",
+   "read_only": 1
+  },
+  {
+   "description": "The server this database was claimed from. Diagnostic only \u2014 a renamed host or a rebuilt container changes it legitimately, so the bucket's ownership lease, not this, decides what is allowed.",
+   "fieldname": "storage_owner_instance",
+   "fieldtype": "Data",
+   "label": "Owner Instance",
    "read_only": 1
   },
   {

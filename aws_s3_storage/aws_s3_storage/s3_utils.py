@@ -451,15 +451,20 @@ def read_file_from_s3(key):
 	return obj["Body"].read()
 
 
-def upload_thumbnail(key, content, content_type):
+def upload_thumbnail(key, content, content_type, file_doc=None):
 	"""Upload a generated thumbnail and return the URL used to serve it.
 
-	Returns None without writing anything when this environment does not own the
-	bucket: a thumbnail is a new object next to the original, so generating one
-	from a restored copy would still be a write into another site's storage.
+	``file_doc`` is the record the thumbnail belongs to, and it is not optional
+	in spirit: the thumbnail key is *derived from the source object's own key*
+	(``<key>_small.png``), so writing it replaces whatever the owning environment
+	has there. That makes it a destructive write against an inherited object, not
+	a harmless new one — it goes through the same per-file ownership and lease
+	checks as a delete. Returns None, writing nothing, when it is refused.
 	"""
 	settings = frappe.get_single("S3 Settings")
-	if not environment.guard("upload a thumbnail", settings=settings):
+	if not environment.guard(
+		"write a thumbnail", file_doc=file_doc, settings=settings, destructive=True, detail=key
+	):
 		return None
 	s3 = get_s3_client()
 	s3.put_object(
@@ -510,7 +515,10 @@ def move_object_privacy(file_doc):
 	# doing any part of that would break the attachment for its real owner, so the
 	# record keeps pointing at the object exactly where it is.
 	if not environment.guard(
-		"move an object between public/ and private/", file_doc=file_doc, settings=settings
+		"move an object between public/ and private/",
+		file_doc=file_doc,
+		settings=settings,
+		destructive=True,
 	):
 		return
 	bucket = settings.bucket_name
@@ -782,17 +790,29 @@ def delete_file_from_s3(doc, only_thumbnail=False):
 	# copy of the database must not reach the files the original is still serving,
 	# and the reference check above it could not see them anyway, because it only
 	# ever queries the database it is running in.
-	if not environment.guard("delete an object", file_doc=doc):
+	if not environment.guard("delete an object", file_doc=doc, destructive=True):
 		return
 
 	# check_documents: a real deletion is the one case where an Attach field still
 	# holding the URL has to win, because nothing would bring the object back.
-	_delete_after_commit(get_bucket(), keys, check_references=True, check_documents=True)
+	_delete_after_commit(
+		get_bucket(),
+		keys,
+		check_references=True,
+		check_documents=True,
+		object_owner=(doc.get("s3_owner") if hasattr(doc, "get") else None),
+	)
 
 
-def _delete_after_commit(bucket, keys, check_references=False, check_documents=False):
+def _delete_after_commit(bucket, keys, check_references=False, check_documents=False, object_owner=None):
 	def _run():
-		_delete_keys(bucket, keys, check_references=check_references, check_documents=check_documents)
+		_delete_keys(
+			bucket,
+			keys,
+			check_references=check_references,
+			check_documents=check_documents,
+			object_owner=object_owner,
+		)
 
 	frappe.db.after_commit.add(_run)
 
@@ -804,14 +824,14 @@ def _delete_on_rollback(bucket, keys):
 	frappe.db.after_rollback.add(_run)
 
 
-def _delete_keys(bucket, keys, check_references=False, check_documents=False):
+def _delete_keys(bucket, keys, check_references=False, check_documents=False, object_owner=None):
 	# Last line of defence. Every caller checks first, but these run inside
 	# after_commit / after_rollback callbacks and from background jobs, so the one
 	# place that actually issues delete_object checks again rather than trusting
-	# that it was reached through a guarded path. Only the environment is checked
-	# here — a bare key carries no owner to compare, and the callers that have the
-	# record already made that check.
-	if not environment.may_modify_storage():
+	# that it was reached through a guarded path. The callers that hold the record
+	# also checked its owner; ``object_owner`` carries that through so the re-check
+	# is the same one and not a weaker version of it.
+	if not environment.may_destroy(owner=object_owner):
 		environment.report_blocked("delete an object", detail=", ".join(keys))
 		return
 
@@ -824,7 +844,7 @@ def _delete_keys(bucket, keys, check_references=False, check_documents=False):
 			s3.delete_object(Bucket=bucket, Key=key)
 		except Exception as e:
 			frappe.logger().error(f"S3 Delete Error for {key}: {e}")
-			_queue_deletion(bucket, key, str(e))
+			_queue_deletion(bucket, key, str(e), object_owner=object_owner)
 
 
 def _key_is_referenced(key, check_documents=False):
@@ -1003,7 +1023,7 @@ def _url_references_key(file_url, key):
 	return key == url_key or key.startswith(url_key)
 
 
-def _queue_deletion(bucket, key, error=None):
+def _queue_deletion(bucket, key, error=None, object_owner=None):
 	"""Record a failed deletion so a scheduler can retry it (avoids orphaned objects).
 
 	Runs the insert in a background job: this is usually called from inside an
@@ -1017,12 +1037,14 @@ def _queue_deletion(bucket, key, error=None):
 			bucket=bucket,
 			key=key,
 			error=error,
+			requested_by_environment=environment.recorded_owner_id(),
+			object_owner=object_owner,
 		)
 	except Exception as e:
 		frappe.logger().error(f"Could not queue S3 deletion for {key}: {e}")
 
 
-def _insert_deletion_row(bucket, key, error=None):
+def _insert_deletion_row(bucket, key, error=None, requested_by_environment=None, object_owner=None):
 	if frappe.db.exists("S3 Deletion Queue", {"s3_key": key}):
 		return
 	frappe.get_doc(
@@ -1031,6 +1053,11 @@ def _insert_deletion_row(bucket, key, error=None):
 			"bucket": bucket,
 			"s3_key": key,
 			"last_error": error,
+			# Who asked, and whose object. A queue row outlives the request that
+			# created it and is restored with the database, so the row has to carry
+			# enough to be re-authorised later rather than trusted on sight.
+			"requested_by_environment": requested_by_environment or environment.recorded_owner_id(),
+			"object_owner": object_owner,
 		}
 	).insert(ignore_permissions=True)
 	frappe.db.commit()
@@ -1069,13 +1096,14 @@ def process_deletion_queue():
 	rows = frappe.get_all(
 		"S3 Deletion Queue",
 		filters={"status": "Pending"},
-		fields=["name", "bucket", "s3_key", "attempts"],
+		fields=["name", "bucket", "s3_key", "attempts", "requested_by_environment", "object_owner"],
 		limit=200,
 	)
 	if not rows:
 		return
 
 	bucket = settings.bucket_name
+	owner_id = environment.recorded_owner_id(settings)
 	s3 = get_s3_client()
 	for row in rows:
 		if row.bucket != bucket:
@@ -1083,6 +1111,26 @@ def process_deletion_queue():
 				row.name,
 				f"Blocked: queued against bucket '{row.bucket}', this site now uses '{bucket}'.",
 			)
+			continue
+
+		# Re-authorise the *request*, not just the environment running it. A row
+		# queued by another environment is that environment's decision, made
+		# against a database this one cannot vouch for — and taking ownership of
+		# the bucket does not retroactively make its judgement ours. This is what
+		# stops a restored copy that has adopted the bucket from executing the
+		# backlog it inherited.
+		requested_by = (row.requested_by_environment or "").strip()
+		if requested_by and requested_by != owner_id:
+			_park_deletion(
+				row.name,
+				f"Blocked: queued by environment '{requested_by}', which is not this one.",
+			)
+			continue
+
+		# And re-authorise the object: the row may name a file another environment
+		# owns even when this environment queued it.
+		if not environment.may_destroy(owner=row.object_owner, settings=settings):
+			_park_deletion(row.name, f"Blocked: {environment.blocked_reason(settings)}")
 			continue
 
 		# Re-check now, not when the row was written: a key that came back into use

@@ -49,7 +49,12 @@ FILE_CUSTOM_FIELDS = {
 			"length": 64,
 			"read_only": 1,
 			"hidden": 1,
-			"no_copy": 1,
+			# Unlike the key columns, this is *not* no_copy: it describes the object,
+			# so a record that inherits the object must inherit its owner too. A
+			# copy that arrived without one is a record the guard would read as
+			# "unknown owner" and let through (see S3File._backfill_s3_keys, which
+			# recovers it from the record the key came from).
+			"no_copy": 0,
 			"search_index": 1,
 			"insert_after": "s3_thumbnail_key",
 		},

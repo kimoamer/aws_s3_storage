@@ -5,7 +5,7 @@ import base64
 import hashlib
 import os
 import tempfile
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +13,7 @@ import frappe
 from botocore.exceptions import ClientError
 from frappe.core.doctype.file.file import File
 from frappe.tests.utils import FrappeTestCase
+from frappe.utils import add_to_date, now_datetime
 
 from aws_s3_storage.aws_s3_storage import environment, s3_utils
 
@@ -38,6 +39,21 @@ class TestS3Settings(FrappeTestCase):
 		# depending on how the test site was created.
 		frappe.db.set_single_value("S3 Settings", "storage_owner_id", environment.local_owner_id())
 		frappe.db.set_single_value("S3 Settings", "storage_owner_site", environment.current_site())
+		frappe.db.set_single_value("S3 Settings", "storage_owner_instance", environment.instance_id())
+		# There is no real bucket here to hold an ownership lease, so seed the
+		# answer the lease check caches. Tests that are *about* the lease clear it
+		# and drive _read_lease themselves (see _with_lease).
+		self._seed_lease(environment.LEASE_OK)
+
+	def _seed_lease(self, status, reason=None, bucket="test-bucket"):
+		frappe.cache().set_value(
+			f"{environment._LEASE_CACHE_KEY}:{bucket}",
+			{"status": status, "reason": reason, "holder": {}},
+			expires_in_sec=environment.LEASE_CHECK_INTERVAL,
+		)
+
+	def _clear_lease_cache(self, bucket="test-bucket"):
+		frappe.cache().delete_value(f"{environment._LEASE_CACHE_KEY}:{bucket}")
 
 	# --- helpers -----------------------------------------------------------
 
@@ -91,6 +107,38 @@ class TestS3Settings(FrappeTestCase):
 
 	def _owner_site(self):
 		return self._environment(db_owner="this-environment", disk_owner="this-environment")
+
+	@contextmanager
+	def _with_lease(self, lease, instance=None):
+		"""Run against a given lease object in the bucket, uncached.
+
+		``lease`` is what ``_read_lease`` returns — a dict, or None for "no lease
+		object yet". ``instance`` overrides what this server answers as its own
+		identity, which is how a copy running on another machine is simulated.
+		"""
+		self._clear_lease_cache()
+		try:
+			with ExitStack() as stack:
+				stack.enter_context(patch.object(environment, "_read_lease", return_value=lease))
+				stack.enter_context(
+					patch.object(environment, "_write_lease", side_effect=lambda settings: lease or {})
+				)
+				if instance is not None:
+					stack.enter_context(patch.object(environment, "instance_id", return_value=instance))
+				yield
+		finally:
+			self._clear_lease_cache()
+			self._seed_lease(environment.LEASE_OK)
+
+	@staticmethod
+	def _live_lease(owner_id="this-environment", instance="server-a", site="prod.example.com"):
+		return {
+			"owner_id": owner_id,
+			"instance": instance,
+			"site": site,
+			"host": "prod-host",
+			"heartbeat_at": now_datetime().isoformat(),
+		}
 
 	@contextmanager
 	def _file_doc(self, file_doc):
@@ -1651,3 +1699,247 @@ class TestS3Settings(FrappeTestCase):
 			self._reevaluate(file_url=s3_url, s3_key=key, attached_to_doctype="Sales Invoice"), []
 		)
 		self.assertEqual(self._reevaluate(file_url="/files/a.pdf", attached_to_doctype="Sales Invoice"), [])
+
+	# --- a copy of the whole server, keeping the site name -----------------
+	# The case the local checks cannot see: the database id, the site_config.json
+	# id and the site name were all copied, so all three agree on the copy. Only
+	# the bucket — the thing the two servers share — can tell them apart.
+
+	def test_a_full_server_copy_still_looks_like_the_owner_locally(self):
+		# Stated plainly because it is the premise of everything below: the local
+		# checks pass on such a copy. They are not the protection here.
+		with self._environment(db_owner="prod-env", disk_owner="prod-env"):
+			self.assertEqual(environment.state(), environment.OWNER)
+			self.assertTrue(environment.may_modify_storage())
+
+	def test_a_full_server_copy_may_not_destroy_anything(self):
+		# ... and the lease catches it: the bucket still names the original server,
+		# which was heard from moments ago.
+		lease = self._live_lease(owner_id="prod-env", instance="the-original-server")
+		with self._environment(db_owner="prod-env", disk_owner="prod-env"):
+			with self._with_lease(lease, instance="the-copy"):
+				result = environment.check_lease(refresh=True)
+				self.assertEqual(result.status, environment.LEASE_CONFLICT)
+				self.assertFalse(environment.may_destroy())
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_a_full_server_copy_does_not_reach_delete_object(self, mock_get_client):
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+		lease = self._live_lease(owner_id="prod-env", instance="the-original-server")
+
+		with self._environment(db_owner="prod-env", disk_owner="prod-env"):
+			with self._with_lease(lease, instance="the-copy"):
+				s3_utils._delete_keys("test-bucket", ["private/uid/report.pdf"])
+				doc = frappe._dict(s3_key="private/uid/report.pdf", file_url="/x")
+				with patch.object(s3_utils, "_delete_after_commit") as scheduled:
+					s3_utils.delete_file_from_s3(doc)
+
+		s3.delete_object.assert_not_called()
+		scheduled.assert_not_called()
+
+	def test_the_original_server_keeps_working(self):
+		# The other half of the same scenario: the server the lease names is not
+		# blocked by its own lease.
+		lease = self._live_lease(owner_id="this-environment", instance="the-original-server")
+		with self._owner_site(), self._with_lease(lease, instance="the-original-server"):
+			self.assertEqual(environment.check_lease(refresh=True).status, environment.LEASE_OK)
+			self.assertTrue(environment.may_destroy())
+
+	def test_an_abandoned_lease_is_taken_over(self):
+		# A renamed host, a rebuilt container, a finished server move: the identity
+		# changed legitimately and nobody else is there. It must heal by itself,
+		# not need a button.
+		stale = self._live_lease(instance="the-old-container")
+		stale["heartbeat_at"] = add_to_date(now_datetime(), seconds=-(environment.LEASE_STALE_AFTER + 60))
+		stale["heartbeat_at"] = stale["heartbeat_at"].isoformat()
+
+		with self._owner_site(), self._with_lease(stale, instance="the-new-container"):
+			self.assertEqual(environment.check_lease(refresh=True).status, environment.LEASE_OK)
+
+	def test_a_bucket_leased_to_another_environment_is_a_conflict(self):
+		# Pointing a second site at a bucket that is already someone's.
+		with self._owner_site():
+			with self._with_lease(self._live_lease(owner_id="someone-elses-env"), instance="mine"):
+				result = environment.check_lease(refresh=True)
+				self.assertEqual(result.status, environment.LEASE_CONFLICT)
+				self.assertIn("someone-elses-env", result.reason)
+
+	def test_an_unreadable_lease_blocks_destruction_but_not_uploads(self):
+		# Losing sight of the bucket's lease means we cannot rule out a second live
+		# writer. Deletes wait (a failed delete is queued, nothing is lost); uploads
+		# are additive and carry on, so an S3 hiccup does not silently start
+		# scattering files onto local disk.
+		with self._owner_site():
+			self._clear_lease_cache()
+			with patch.object(environment, "_read_lease", side_effect=RuntimeError("AccessDenied")):
+				self.assertEqual(environment.check_lease(refresh=True).status, environment.LEASE_UNVERIFIED)
+				self.assertFalse(environment.may_destroy())
+				self.assertTrue(environment.may_modify_storage())
+				self.assertTrue(s3_utils.should_store_in_s3(frappe._dict(attached_to_doctype="Lead")))
+			self._clear_lease_cache()
+		self._seed_lease(environment.LEASE_OK)
+
+	def test_the_lease_is_only_read_for_destructive_work(self):
+		# The upload path must not pay for a round-trip to S3 on every file.
+		with self._owner_site():
+			self._clear_lease_cache()
+			with patch.object(environment, "_read_lease") as read:
+				s3_utils.should_store_in_s3(frappe._dict(attached_to_doctype="Lead"))
+			read.assert_not_called()
+		self._seed_lease(environment.LEASE_OK)
+
+	# --- an unproven environment is not a permitted one --------------------
+
+	def test_unclaimed_may_not_modify_anything(self):
+		# An old backup carries no owner id at all, so it is unclaimed wherever it
+		# is restored. Absence of proof is not permission.
+		with self._environment(db_owner="", disk_owner=None):
+			self.assertEqual(environment.state(), environment.UNCLAIMED)
+			self.assertFalse(environment.may_modify_storage())
+			self.assertFalse(environment.may_destroy())
+			self.assertIn("No environment has claimed", environment.blocked_reason())
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_unclaimed_does_not_reach_delete_object(self, mock_get_client):
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+		with self._environment(db_owner="", disk_owner=None):
+			s3_utils._delete_keys("test-bucket", ["private/uid/report.pdf"])
+		s3.delete_object.assert_not_called()
+
+	def test_unclaimed_uploads_to_local_disk(self):
+		with self._environment(db_owner="", disk_owner=None):
+			self.assertFalse(s3_utils.should_store_in_s3(frappe._dict(attached_to_doctype="Lead")))
+
+	# --- thumbnails are a write over the source object's own key -----------
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_no_thumbnail_is_written_over_another_environments_object(self, mock_get_client):
+		# The thumbnail key is derived from the file's key, so this replaces an
+		# object the other environment owns — the per-file check has to apply here
+		# exactly as it does to a delete.
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+		doc = frappe._dict(s3_owner="prod-environment")
+
+		with self._owner_site():
+			self.assertIsNone(
+				s3_utils.upload_thumbnail("private/uid/pic_small.png", b"x", "image/png", file_doc=doc)
+			)
+		s3.put_object.assert_not_called()
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_no_thumbnail_is_written_while_the_lease_is_contested(self, mock_get_client):
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+		lease = self._live_lease(owner_id="this-environment", instance="the-original-server")
+
+		with self._owner_site(), self._with_lease(lease, instance="the-copy"):
+			self.assertIsNone(s3_utils.upload_thumbnail("private/uid/pic_small.png", b"x", "image/png"))
+		s3.put_object.assert_not_called()
+
+	def test_a_copied_attachment_keeps_the_objects_owner(self):
+		# s3_owner is recovered from the record the key came from. Without this a
+		# copy (an Amend, a record built from a URL) arrives with no owner, which
+		# the guard reads as "unknown" and lets through — for precisely the
+		# inherited files that need protecting.
+		from aws_s3_storage.aws_s3_storage.file_override import S3File
+
+		key = "private/uid/inherited.pdf"
+		frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": "inherited.pdf",
+				"file_url": s3_utils._build_file_url(key),
+				"s3_key": key,
+				"s3_owner": "prod-environment",
+				"is_private": 1,
+			}
+		).insert(ignore_permissions=True)
+		# Left to the test transaction's rollback on purpose: deleting it here would
+		# run after that rollback, and would go through the S3 delete path.
+
+		copy = S3File(
+			{"doctype": "File", "file_name": "inherited.pdf", "file_url": s3_utils._build_file_url(key)}
+		)
+		copy._backfill_s3_keys()
+
+		self.assertEqual(copy.s3_key, key)
+		self.assertEqual(copy.s3_owner, "prod-environment")
+		with self._owner_site():
+			self.assertFalse(environment.may_modify_object(copy))
+
+	# --- a queued deletion is a request, not a fact ------------------------
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_a_deletion_queued_by_another_environment_is_never_executed(self, mock_get_client):
+		# The scenario the environment check alone misses: a restored copy takes
+		# ownership of the bucket (deliberately) *before* the inherited backlog is
+		# parked. Ownership does not make production's queued decisions this
+		# site's to carry out.
+		row = self._queue_row("private/uid/report.pdf")
+		frappe.db.set_value("S3 Deletion Queue", row.name, "requested_by_environment", "prod-environment")
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+
+		with self._owner_site(), patch.object(frappe.db, "commit"):
+			s3_utils.process_deletion_queue()
+
+		s3.delete_object.assert_not_called()
+		self.assertEqual(frappe.db.get_value("S3 Deletion Queue", row.name, "status"), "Blocked")
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_a_deletion_naming_another_environments_object_is_never_executed(self, mock_get_client):
+		row = self._queue_row("private/uid/report.pdf")
+		frappe.db.set_value(
+			"S3 Deletion Queue",
+			row.name,
+			{"requested_by_environment": "this-environment", "object_owner": "prod-environment"},
+		)
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+
+		with self._owner_site(), patch.object(frappe.db, "commit"):
+			s3_utils.process_deletion_queue()
+
+		s3.delete_object.assert_not_called()
+		self.assertEqual(frappe.db.get_value("S3 Deletion Queue", row.name, "status"), "Blocked")
+
+	@patch.object(s3_utils, "get_s3_client")
+	def test_this_environments_own_request_still_runs(self, mock_get_client):
+		row = self._queue_row("private/uid/report.pdf")
+		frappe.db.set_value("S3 Deletion Queue", row.name, "requested_by_environment", "this-environment")
+		s3 = MagicMock()
+		mock_get_client.return_value = s3
+
+		with (
+			self._owner_site(),
+			patch.object(s3_utils, "_key_is_referenced", return_value=False),
+			patch.object(frappe.db, "commit"),
+		):
+			s3_utils.process_deletion_queue()
+
+		s3.delete_object.assert_called_once()
+
+	def test_a_queued_deletion_records_who_asked_and_for_whose_object(self):
+		with self._owner_site(), patch.object(frappe.db, "commit"):
+			s3_utils._insert_deletion_row(
+				"test-bucket", "private/uid/report.pdf", error="network", object_owner="prod-environment"
+			)
+		name = frappe.db.get_value("S3 Deletion Queue", {"s3_key": "private/uid/report.pdf"})
+		row = frappe.db.get_value(
+			"S3 Deletion Queue", name, ["requested_by_environment", "object_owner"], as_dict=True
+		)
+		self.assertEqual(row.object_owner, "prod-environment")
+		self.assertTrue(row.requested_by_environment)
+
+	# --- instance identity -------------------------------------------------
+
+	def test_an_explicit_instance_id_overrides_the_derived_one(self):
+		# The only thing that separates a bit-identical clone from its original is
+		# something the deployment sets from outside the copied filesystem.
+		derived = environment.instance_id()
+		with patch.dict(os.environ, {environment.INSTANCE_ENV_VAR: "blue-deployment"}):
+			self.assertEqual(environment.instance_id(), "blue-deployment")
+		self.assertEqual(environment.instance_id(), derived)

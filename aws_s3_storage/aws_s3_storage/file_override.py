@@ -224,6 +224,32 @@ class S3File(File):
 			thumb_key = s3_utils._extract_key(self.thumbnail_url)
 			if thumb_key:
 				self.s3_thumbnail_key = thumb_key
+		self._backfill_s3_owner()
+
+	def _backfill_s3_owner(self):
+		"""Recover which environment owns the object this record points at.
+
+		A record can arrive holding a key but no owner: an Amend copy, a record
+		built straight from a URL, a row written with db_set or SQL, or anything
+		created before the column existed. The guard reads a missing owner as
+		"unknown", which the current owner may modify — so a copy that lost the
+		owner would quietly become modifiable, exactly for the inherited files
+		that most need protecting. The object's owner is whatever the record the
+		key came from says, so take it from there.
+		"""
+		key = self.get("s3_key")
+		if not key or self.get("s3_owner"):
+			return
+		try:
+			owner = frappe.db.get_value(
+				"File",
+				{"s3_key": key, "s3_owner": ["is", "set"], "name": ["!=", self.get("name") or ""]},
+				"s3_owner",
+			)
+		except Exception:
+			return
+		if owner:
+			self.s3_owner = owner
 
 	def get_full_path(self):
 		# Frappe's get_full_path() runs the "/api/method/..." URL through is_safe_path()
@@ -313,7 +339,9 @@ class S3File(File):
 		thumb_key = f"{base}_{suffix}.{ext}" if dot else f"{key}_{suffix}"
 		content_type = Image.MIME.get(image_format, "image/png")
 
-		thumbnail_url = s3_utils.upload_thumbnail(thumb_key, buffer.getvalue(), content_type)
+		# Pass the record: the thumbnail key is derived from this file's own key, so
+		# writing it replaces whatever sits there for whoever owns the file.
+		thumbnail_url = s3_utils.upload_thumbnail(thumb_key, buffer.getvalue(), content_type, file_doc=self)
 		if not thumbnail_url:
 			# Refused: this environment does not own the bucket (or it is read-only).
 			# The record keeps whatever thumbnail it already had — writing a URL for

@@ -217,6 +217,23 @@ function show_ownership_state(frm) {
 				return;
 			}
 
+			// The bucket says another live server holds ownership. Local state looks
+			// fine — that is the point: this is the only signal a copy of the whole
+			// server produces, so it has to be the loudest thing on the form.
+			if (s.lease_status === "conflict") {
+				frm.dashboard.clear_headline();
+				frm.set_intro(
+					`<b>${__("Another server is using this bucket right now.")}</b><br>` +
+						`${frappe.utils.escape_html(s.lease_reason || "")}<br><br>` +
+						__(
+							"Nothing in the bucket will be deleted, moved or overwritten from this site until that is resolved. If this site is the copy, point it at its own bucket. If this site is the real one and the other is gone, use <b>Take Ownership of This Storage</b>."
+						),
+					"red",
+					true
+				);
+				return;
+			}
+
 			if (s.read_only_mode) {
 				frm.set_intro(
 					__(
@@ -231,7 +248,7 @@ function show_ownership_state(frm) {
 			if (s.state === "unclaimed") {
 				frm.set_intro(
 					__(
-						"<b>No environment has claimed this storage yet.</b> Run <code>bench migrate</code>, or use <b>Take Ownership of This Storage</b>, so that a copy of this database restored onto another site can be told apart from this one."
+						"<b>No environment has claimed this storage, so nothing here is modifying the bucket.</b> New uploads are going to local disk, and objects are not deleted or moved. Run <code>bench migrate</code>, or use <b>Take Ownership of This Storage</b>, on the site that really owns the bucket."
 					),
 					"orange",
 					true
@@ -239,7 +256,28 @@ function show_ownership_state(frm) {
 				return;
 			}
 
-			frm.set_intro(null);
+			if (s.lease_status === "unverified") {
+				frm.set_intro(
+					`<b>${__("The bucket's ownership lease could not be checked.")}</b><br>` +
+						`${frappe.utils.escape_html(s.lease_reason || "")}<br><br>` +
+						__(
+							"Uploads still work; deleting, moving and overwriting objects is on hold until the lease can be read, because a second live server cannot be ruled out."
+						),
+					"orange",
+					true
+				);
+				return;
+			}
+
+			frm.set_intro(
+				s.instance_changed
+					? __(
+							"This site owns the storage, but it is running on a different server than the one that claimed it. That is normal after a rename, a rebuild or a move — the bucket's lease confirms only one server is using it."
+					  )
+					: null,
+				"blue",
+				true
+			);
 			frm.dashboard.set_headline(
 				__("This site owns the storage ({0}).", [frappe.utils.escape_html(s.owner_id || "")]) +
 					(s.files_untagged
@@ -255,6 +293,30 @@ function show_ownership_state(frm) {
 }
 
 function confirm_take_ownership(frm) {
+	// Re-read the lease rather than trusting the cached answer: this is the one
+	// moment where a stale "all fine" is the dangerous one.
+	frappe.call({
+		method: "aws_s3_storage.aws_s3_storage.environment.get_environment_status",
+		args: { check_bucket: 1 },
+		freeze: true,
+		freeze_message: __("Checking who owns this bucket…"),
+		callback: (r) => show_take_ownership_dialog(frm, r.message || {}),
+	});
+}
+
+function show_take_ownership_dialog(frm, status) {
+	const holder = status.lease_holder || {};
+	const contested =
+		status.lease_status === "conflict"
+			? `<p class="text-danger"><b>${__("Another server is live against this bucket right now")}</b>${
+					holder.host ? ` (${frappe.utils.escape_html(holder.host)})` : ""
+			  }${
+					holder.heartbeat_at ? `, ${__("last seen")} ${frappe.utils.escape_html(holder.heartbeat_at)}` : ""
+			  }. ${__(
+					"Taking ownership here will stop that server from deleting or moving anything. Do this only if you know it should no longer be using the bucket."
+			  )}</p>`
+			: "";
+
 	const d = new frappe.ui.Dialog({
 		title: __("Take ownership of this storage"),
 		fields: [
@@ -264,6 +326,7 @@ function confirm_take_ownership(frm) {
 					"This site will become the owner of bucket <b>{0}</b>, and will be allowed to move and delete objects in it.",
 					[frappe.utils.escape_html(frm.doc.bucket_name || "")]
 				)}</p>
+				${contested}
 				<p class="text-danger">${__(
 					"Only do this if no other site is still using this bucket. If you are setting up a test copy, give it its <b>own</b> bucket first — otherwise you are taking control of the files your live site is serving."
 				)}</p>`,
@@ -286,7 +349,21 @@ function confirm_take_ownership(frm) {
 				freeze: true,
 				callback: (r) => {
 					if (r.exc) return;
-					frappe.show_alert({ message: __("This site now owns the storage."), indicator: "green" });
+					const lease_error = r.message && r.message.lease_error;
+					if (lease_error) {
+						frappe.msgprint({
+							title: __("Ownership recorded, but not in the bucket"),
+							message:
+								__("This site is now the recorded owner, but the lease object could not be written:") +
+								`<br><code>${frappe.utils.escape_html(lease_error)}</code><br><br>` +
+								__(
+									"Until it can be, other servers pointed at this bucket will not know, and deleting or moving objects stays on hold here."
+								),
+							indicator: "orange",
+						});
+					} else {
+						frappe.show_alert({ message: __("This site now owns the storage."), indicator: "green" });
+					}
 					frm.reload_doc();
 				},
 			});
